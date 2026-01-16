@@ -1,0 +1,1 @@
+{"arg_types":{"a":"Bool","b":"Bool"},"body":{"kind":"binop","left":{"kind":"var","name":"a"},"op":"and","right":{"kind":"var","name":"b"}},"name":"and","post":[],"pre":[],"return_type":"Bool"}

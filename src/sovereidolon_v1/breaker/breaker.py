@@ -66,10 +66,12 @@ def _mutate_inputs(base: Dict[str, Any], family: str, rng: random.Random) -> Dic
 
 def _minimize_failure(
     inputs: Dict[str, Any], spec: TaskSpec, program: Any, step_limit: int
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], int]:
     if "xs" in inputs:
         xs = list(inputs["xs"])
+        steps = 0
         while len(xs) > 1:
+            steps += 1
             candidate_list = {"xs": xs[: len(xs) // 2]}
             expected = spec.evaluate(candidate_list)
             actual, _ = eval_program(program, candidate_list, step_limit)
@@ -77,16 +79,18 @@ def _minimize_failure(
                 xs = candidate_list["xs"]
             else:
                 break
-        return {"xs": xs}
+        return {"xs": xs}, steps
     x = int(inputs["x"])
     y = int(inputs["y"])
+    steps = 0
     for dx, dy in [(0, 0), (x // 2, y // 2), (x - 1, y - 1)]:
+        steps += 1
         candidate_int = {"x": dx, "y": dy}
         expected = spec.evaluate(candidate_int)
         actual, _ = eval_program(program, candidate_int, step_limit)
         if expected != actual:
-            return candidate_int
-    return inputs
+            return candidate_int, steps
+    return inputs, steps
 
 
 @dataclass
@@ -193,12 +197,13 @@ class BreakerLab:
 
         tmr = 0.0
         if found is not None:
-            t0 = time.time_ns()
-            minimized_inputs = _minimize_failure(
+            minimized_inputs, minimized_steps = _minimize_failure(
                 found.inputs, spec, program, self.settings.verify_budget_steps
             )
             minimized = Example(inputs=minimized_inputs, output=spec.evaluate(minimized_inputs))
-            tmr = (time.time_ns() - t0) / 1e9
+            tmr = minimized_steps / max(1, attempts)
+        else:
+            minimized_steps = 0
 
         history = self._load_history()[-self.settings.breaker_novelty_window :]
         nov_score = _novelty_score(found.inputs if found else tests[0].inputs, history)
@@ -222,5 +227,6 @@ class BreakerLab:
             "duration_ns": time.time_ns() - start,
             "withheld_trials": withheld_trials,
             "withheld_hits": withheld_hits,
+            "minimized_steps": minimized_steps,
         }
         return BreakerResult(counterexample=found, minimized=minimized, kpi=kpi, report=report)

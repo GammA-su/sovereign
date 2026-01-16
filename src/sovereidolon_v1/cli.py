@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import typer
 from rich.console import Console
@@ -15,7 +15,7 @@ from .ledger.ledger import Ledger
 from .orchestrator.episode import episode_run
 from .orchestrator.task import load_task
 from .schemas import UCR, export_schemas
-from .utils import ensure_dir, hash_bytes, read_json, write_json
+from .utils import canonical_dumps, ensure_dir, hash_bytes, read_json, read_jsonl, write_json
 
 app = typer.Typer(help="SOVEREIDOLON v1 CLI")
 console = Console()
@@ -32,6 +32,11 @@ CONTEXT_OPTION = typer.Option(
 )
 POLICY_OPTION = typer.Option("v1", "--policy-version")
 SCHEMA_OUT_OPTION = typer.Option(Path("schemas"), "--out-dir")
+WARM_START_OPTION = typer.Option(None, "--warm-start-store", exists=True, file_okay=False)
+SUITE_WARM_START_OPTION = typer.Option(None, "--warm-start-store", exists=True, file_okay=False)
+SUITE_FILE_OPTION = typer.Option(..., "--suite-file", exists=True)
+OUT_DIR_OPTION = typer.Option(..., "--out-dir")
+STORE_DIR_OPTION = typer.Option(..., "--store", exists=True, file_okay=False)
 
 
 episode_app = typer.Typer(help="Episode commands")
@@ -40,6 +45,8 @@ bg_app = typer.Typer(help="Belief graph commands")
 demo_app = typer.Typer(help="Demos")
 schema_app = typer.Typer(help="Schema utilities")
 run_app = typer.Typer(help="Run audits")
+store_app = typer.Typer(help="Store commands")
+suite_app = typer.Typer(help="Suites")
 
 
 @app.callback()
@@ -79,8 +86,11 @@ def episode_run_cmd(
     run_dir: Optional[Path] = RUN_DIR_OPTION,
     run_id: Optional[str] = RUN_ID_OPTION,
     config: Optional[Path] = CONFIG_OPTION,
+    warm_start_store: Optional[Path] = WARM_START_OPTION,
 ) -> None:
     settings = _load_settings(config)
+    if warm_start_store:
+        settings = settings.model_copy(update={"warm_start_store": str(warm_start_store)})
     if run_dir is None:
         run_root = Path("runs")
         ensure_dir(run_root)
@@ -179,7 +189,7 @@ def bg_verify_replay_cmd(run_dir: Path = RUN_DIR_REQUIRED_OPTION) -> None:
         raise typer.Exit(code=1)
 
 
-def audit_run(run_dir: Path) -> dict[str, object]:
+def audit_run(run_dir: Path) -> dict[str, Any]:
     checks: dict[str, bool] = {}
     errors: list[str] = []
 
@@ -294,6 +304,281 @@ def run_audit_cmd(run_dir: Path = RUN_DIR_REQUIRED_OPTION) -> None:
     console.print(report)
     if not report["ok"]:
         raise typer.Exit(code=1)
+
+
+def _load_first_witness(run_dir: Path) -> tuple[Path | None, dict[str, Any]]:
+    witnesses_dir = run_dir / "witnesses"
+    if not witnesses_dir.exists():
+        return None, {}
+    witness_files = sorted(witnesses_dir.glob("*.json"))
+    if not witness_files:
+        return None, {}
+    path = witness_files[0]
+    return path, read_json(path)
+
+
+def _infer_witness_id(run_dir: Path, ucr_data: dict[str, Any]) -> str:
+    hashes = ucr_data.get("hashes", {})
+    witness_id = str(hashes.get("witness_id") or "")
+    if witness_id:
+        return witness_id
+    witness_file, witness_data = _load_first_witness(run_dir)
+    if witness_file and witness_data:
+        if witness_data.get("witness_id"):
+            return str(witness_data["witness_id"])
+        return witness_file.stem
+    return ""
+
+
+def _last_run_end_payload(run_dir: Path) -> dict[str, Any]:
+    ledger_path = run_dir / "ledger.jsonl"
+    if not ledger_path.exists():
+        return {}
+    entries = read_jsonl(ledger_path)
+    for entry in reversed(entries):
+        if entry.get("type") == "RUN_END":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict):
+                return payload
+            return {}
+    return {}
+
+
+def migrate_run(run_dir: Path, in_place: bool) -> dict[str, object]:
+    run_dir = Path(run_dir)
+    ledger = Ledger(run_dir / "ledger.jsonl")
+    capsules_dir = run_dir / "capsules"
+    capsule_paths = sorted(capsules_dir.glob("failure_*.json")) if capsules_dir.exists() else []
+    ucr_data = read_json(run_dir / "ucr.json") if (run_dir / "ucr.json").exists() else {}
+    witness_file, witness_data = _load_first_witness(run_dir)
+    overall_verdict = witness_data.get("overall_verdict") if witness_data else ""
+    witness_id = _infer_witness_id(run_dir, ucr_data)
+    if not witness_id:
+        witness_id = str(_last_run_end_payload(run_dir).get("witness_id", ""))
+    touched: list[dict[str, Any]] = []
+
+    if overall_verdict == "FAIL" and witness_id:
+        for capsule_path in capsule_paths:
+            capsule = read_json(capsule_path)
+            if capsule.get("witness_id"):
+                continue
+            before = canonical_dumps(capsule)
+            capsule["witness_id"] = witness_id
+            after = canonical_dumps(capsule)
+            write_json(capsule_path, capsule)
+            touched.append(
+                {
+                    "path": str(capsule_path),
+                    "before_hash": hash_bytes(before),
+                    "after_hash": hash_bytes(after),
+                }
+            )
+
+    if touched:
+        migration_payload = {
+            "migration_version": "v1",
+            "from_schema_version": "v1",
+            "to_schema_version": "v1",
+            "changes": ["capsule_add_witness_id"],
+            "capsules": touched,
+            "in_place": in_place,
+        }
+        ledger.append("RUN_MIGRATED", migration_payload)
+    report: dict[str, Any] = audit_run(run_dir)
+    result: dict[str, object] = {
+        "ok": bool(report.get("ok")),
+        "files_touched": touched,
+        "audit": report,
+    }
+    return result
+
+
+@run_app.command("migrate")
+def run_migrate_cmd(
+    run_dir: Path = RUN_DIR_REQUIRED_OPTION, in_place: bool = typer.Option(False, "--in-place")
+) -> None:
+    report = migrate_run(run_dir, in_place=in_place)
+    console.print(report)
+    if not report["ok"]:
+        raise typer.Exit(code=1)
+
+
+@store_app.command("audit")
+def store_audit_cmd(
+    store_dir: Path = STORE_DIR_OPTION
+) -> None:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        console.print({"ok": False, "errors": ["manifest_missing"], "checks": {}})
+        raise typer.Exit(code=1)
+    manifest = read_json(manifest_path)
+    programs = manifest.get("programs", {})
+    errors: list[str] = []
+    for program_hash, entry in programs.items():
+        default_path = store_dir / entry.get("domain", "") / f"{program_hash}.json"
+        entry_path = Path(entry.get("store_path", default_path))
+        if not entry_path.exists():
+            errors.append(f"missing:{program_hash}")
+            continue
+        data = entry_path.read_bytes()
+        if hash_bytes(data) != program_hash:
+            errors.append(f"hash_mismatch:{program_hash}")
+        if entry.get("store_path"):
+            if Path(entry["store_path"]).resolve() != entry_path.resolve():
+                errors.append(f"path_mismatch:{program_hash}")
+    ok = not errors
+    report = {"ok": ok, "checks": {"manifest_consistency": ok}, "errors": errors}
+    console.print(report)
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@suite_app.command("run")
+def suite_run_cmd(
+    suite_file: Path = SUITE_FILE_OPTION,
+    out_dir: Path = OUT_DIR_OPTION,
+    policy_version: str = POLICY_OPTION,
+    warm_start_store: Optional[Path] = SUITE_WARM_START_OPTION,
+) -> None:
+    suite_data = read_json(suite_file)
+    suite_id = suite_data.get("suite_id", suite_file.stem)
+    tasks = suite_data.get("tasks", [])
+    report_dir = out_dir
+    ensure_dir(report_dir)
+
+    store_dir = report_dir / "store"
+    ensure_dir(store_dir)
+    manifest_path = store_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+    else:
+        manifest = {"schema_version": "v1", "programs": {}}
+    programs: dict[str, dict[str, Any]] = manifest.setdefault("programs", {})
+
+    totals = {"pass": 0, "fail": 0, "audit_failures": 0}
+    per_task: List[dict[str, Any]] = []
+    store_updates: List[dict[str, str]] = []
+
+    for entry in tasks:
+        task_file = Path(entry["task_file"])
+        task = load_task(task_file)
+        overrides = dict(entry.get("overrides", {}))
+        if warm_start_store and not overrides.get("warm_start_store"):
+            overrides["warm_start_store"] = str(warm_start_store)
+        settings = Settings(**overrides)
+        task_run_dir = report_dir / task_file.stem
+        summary = episode_run(task_file=task_file, run_dir=task_run_dir, settings=settings)
+        actual_run = Path(summary["ucr_path"]).parent
+        audit_report = audit_run(actual_run)
+        ucr_data = read_json(actual_run / "ucr.json")
+        program_hash = ucr_data.get("hashes", {}).get("program_hash", "")
+        decision_path = actual_run / "forge" / "decision.json"
+        decision_data: dict[str, Any] = {}
+        if decision_path.exists():
+            decision_data = read_json(decision_path)
+        if not decision_data:
+            decision_data = {"decision": "REJECT", "reason": "unknown"}
+        breaker_kpi: dict[str, Any] = {}
+        breaker_path = actual_run / "artifacts" / "reports" / "breaker_kpi.json"
+        if breaker_path.exists():
+            breaker_kpi = read_json(breaker_path)
+        else:
+            breaker_kpi = {
+                "status": "SKIPPED",
+                "reason": decision_data.get("reason", "CEGIS_UNSAT"),
+            }
+        per_task.append(
+            {
+                "task_id": summary["task_id"],
+                "verdict": summary["verdict"],
+                "active_view_hash": summary["active_view_hash"],
+                "program_hash": program_hash,
+                "breaker_kpi": breaker_kpi,
+                "forge_decision": decision_data,
+                "audit_ok": audit_report["ok"],
+                "synth_ns": summary.get("synth_ns", 0),
+                "warm_start_store": summary.get("warm_start_store", False),
+                "warm_start_candidate_hash": summary.get("warm_start_candidate_hash", ""),
+                "warm_start_candidate_rejected": summary.get(
+                    "warm_start_candidate_rejected", False
+                ),
+            }
+        )
+        if summary["verdict"] == "PASS":
+            totals["pass"] += 1
+        else:
+            totals["fail"] += 1
+        if not audit_report["ok"]:
+            totals["audit_failures"] += 1
+        if decision_data.get("decision") == "ADMIT" and program_hash:
+            program_entry = programs.get(program_hash)
+            manifest_spec = task.spec_signature()
+            store_path = store_dir / task.task_type / f"{program_hash}.json"
+            program_json: dict[str, Any] | None = None
+            run_program_path = actual_run / "artifacts" / "bvps" / "program.json"
+            if run_program_path.exists():
+                program_json = read_json(run_program_path)
+            elif settings.warm_start_store:
+                warm_manifest_path = Path(settings.warm_start_store) / "manifest.json"
+                if warm_manifest_path.exists():
+                    warm_manifest = read_json(warm_manifest_path)
+                    warm_programs = warm_manifest.get("programs", {})
+                    warm_entry = warm_programs.get(program_hash, {})
+                    warm_source_path = Path(
+                        warm_entry.get(
+                            "store_path",
+                            Path(settings.warm_start_store)
+                            / warm_entry.get("domain", "")
+                            / f"{program_hash}.json",
+                        )
+                    )
+                    if warm_source_path.exists():
+                        program_json = read_json(warm_source_path)
+            if program_json is None:
+                raise RuntimeError(
+                    f"cannot reproduce admitted program {program_hash} for task {task.task_id}"
+                )
+            ensure_dir(store_path.parent)
+            store_path.write_bytes(canonical_dumps(program_json))
+            if not program_entry:
+                program_entry = {
+                    "program_hash": program_hash,
+                    "domain": task.task_type,
+                    "first_admitted_by_task": summary["task_id"],
+                    "admitted_count": 1,
+                    "last_seen_suite": suite_id,
+                    "provenance_witness_ids": (
+                        [decision_data["witness_id"]]
+                        if decision_data.get("witness_id")
+                        else []
+                    ),
+                    "spec_signature": manifest_spec,
+                    "store_path": str(store_path),
+                }
+                programs[program_hash] = program_entry
+                store_updates.append(
+                    {"program_hash": program_hash, "store_path": str(store_path)}
+                )
+            else:
+                program_entry["admitted_count"] = program_entry.get("admitted_count", 0) + 1
+                program_entry["last_seen_suite"] = suite_id
+                witness_id = decision_data.get("witness_id")
+                if witness_id:
+                    entry_witnesses = program_entry.setdefault("provenance_witness_ids", [])
+                    if witness_id not in entry_witnesses:
+                        entry_witnesses.append(witness_id)
+
+    write_json(manifest_path, manifest)
+    report = {
+        "suite_id": suite_id,
+        "policy_version": policy_version,
+        "per_task": per_task,
+        "totals": totals,
+        "store_updates": store_updates,
+    }
+    report_path = report_dir / "report.json"
+    write_json(report_path, report)
+    console.print({"report": str(report_path)})
 
 
 @demo_app.command("bg")
@@ -413,6 +698,8 @@ app.add_typer(bg_app, name="bg")
 app.add_typer(demo_app, name="demo")
 app.add_typer(schema_app, name="schema")
 app.add_typer(run_app, name="run")
+app.add_typer(store_app, name="store")
+app.add_typer(suite_app, name="suite")
 
 if __name__ == "__main__":
     app()

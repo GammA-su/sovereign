@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import orjson
@@ -10,7 +11,13 @@ from sovereidolon_v1.breaker.breaker import BreakerLab
 from sovereidolon_v1.bvps.cegis import run_cegis
 from sovereidolon_v1.bvps.dsl import Program, binop, var
 from sovereidolon_v1.bvps.interpreter import Interpreter
-from sovereidolon_v1.cli import app, audit_run, bg_replay_cmd, verify_bg_replay
+from sovereidolon_v1.cli import (
+    app,
+    audit_run,
+    bg_replay_cmd,
+    migrate_run,
+    verify_bg_replay,
+)
 from sovereidolon_v1.config import Settings
 from sovereidolon_v1.forge.forge import ForgeGate
 from sovereidolon_v1.ledger.ledger import Ledger
@@ -18,7 +25,7 @@ from sovereidolon_v1.orchestrator.episode import episode_run
 from sovereidolon_v1.orchestrator.specs import task_spec
 from sovereidolon_v1.orchestrator.task import Example, Task
 from sovereidolon_v1.schemas import BGRevisionOp, VerifierVerdict
-from sovereidolon_v1.utils import stable_hash
+from sovereidolon_v1.utils import read_json, stable_hash
 
 
 def test_ledger_chain_verification(tmp_path: Path) -> None:
@@ -170,7 +177,16 @@ def test_fail_closed_no_promote_on_heuristic_only() -> None:
         )
     ]
     gate = ForgeGate()
-    decision = gate.decide(task, program, verdicts, required_passed=True)
+    policy = Settings().admission_policy
+    decision = gate.decide(
+        task,
+        program,
+        verdicts,
+        required_passed=True,
+        admission_policy=policy,
+        controller_overhead_ratio=0.0,
+        withheld_hits=0,
+    )
     assert decision.decision == "REJECT"
 
 
@@ -193,7 +209,16 @@ def test_sealed_canary_quarantine_on_echo() -> None:
         body=binop("+", var("x"), var("y")),
     )
     gate = ForgeGate()
-    decision = gate.decide(task, program, [], required_passed=True)
+    policy = Settings().admission_policy
+    decision = gate.decide(
+        task,
+        program,
+        [],
+        required_passed=True,
+        admission_policy=policy,
+        controller_overhead_ratio=0.0,
+        withheld_hits=0,
+    )
     assert decision.decision == "QUARANTINE"
 
 
@@ -381,6 +406,375 @@ def test_run_audit_detects_tamper(tmp_path: Path) -> None:
     report = audit_run(Path(summary["ucr_path"]).parent)
     assert report["ok"] is False
     assert report["checks"].get("artifact_hashes") is False
+
+
+def test_migrate_populates_capsule_and_audit(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "legacy_fail"
+    episode_run(
+        task_file=Path("examples/tasks/bool_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+
+    capsule_dir = run_dir / "capsules"
+    capsule_path = next(capsule_dir.glob("failure_*.json"))
+    capsule = orjson.loads(capsule_path.read_bytes())
+    capsule.pop("witness_id", None)
+    capsule_path.write_bytes(orjson.dumps(capsule, option=orjson.OPT_SORT_KEYS))
+
+    assert audit_run(run_dir)["ok"] is False
+    report = migrate_run(run_dir, in_place=True)
+    assert report["ok"] is True
+    updated_capsule = orjson.loads(capsule_path.read_bytes())
+    assert updated_capsule.get("witness_id")
+
+    ledger_lines = (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    ledger_entries = [orjson.loads(line) for line in ledger_lines]
+    migration_events = [
+        entry
+        for entry in ledger_entries
+        if entry.get("type") == "RUN_MIGRATED"
+        and entry.get("payload", {}).get("changes") == ["capsule_add_witness_id"]
+    ]
+    assert migration_events
+
+
+def test_bool_task_pass(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "bool_pass"
+    summary = episode_run(
+        task_file=Path("examples/tasks/bool_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+
+
+def test_bool_task_fail_with_capsule(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "bool_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/bool_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    capsule_dir = Path(summary["ucr_path"]).parent / "capsules"
+    assert list(capsule_dir.glob("failure_*.json"))
+
+
+def test_suite_run_reports(tmp_path: Path) -> None:
+    suite_file = tmp_path / "suite.json"
+    suite_payload = {
+        "suite_id": "test_suite",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+            {"task_file": "examples/tasks/arith_02.json"},
+            {"task_file": "examples/tasks/arith_fail_01.json"},
+            {"task_file": "examples/tasks/bool_01.json"},
+            {"task_file": "examples/tasks/bool_fail_01.json"},
+            {"task_file": "examples/tasks/arith_sealed_trap_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    out_dir = tmp_path / "suite_out"
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report = read_json(out_dir / "report.json")
+    assert report["suite_id"] == "test_suite"
+    totals = report["totals"]
+    assert totals["pass"] >= 2
+    assert totals["fail"] >= 3
+    assert totals["audit_failures"] == 0
+    assert report["store_updates"]
+    for task in report["per_task"]:
+        assert task["audit_ok"] is True
+    manifest = read_json(out_dir / "store" / "manifest.json")
+    programs = manifest.get("programs", {})
+    assert programs
+    assert len(report["store_updates"]) == len(programs)
+    assert any(entry.get("admitted_count", 0) > 1 for entry in programs.values())
+
+
+def test_suite_warm_start(tmp_path: Path) -> None:
+    suite_file = tmp_path / "suite.json"
+    suite_payload = {
+        "suite_id": "warm_suite",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+            {"task_file": "examples/tasks/arith_02.json"},
+            {"task_file": "examples/tasks/bool_01.json"},
+            {"task_file": "examples/tasks/bool_fail_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    out_a = tmp_path / "suite_a"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+    report_a = read_json(out_a / "report.json")
+
+    out_b = tmp_path / "suite_b"
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+    report_b = read_json(out_b / "report.json")
+
+    assert report_a["totals"]["pass"] == report_b["totals"]["pass"]
+    assert report_a["totals"]["fail"] == report_b["totals"]["fail"]
+    synth_a = sum(task["synth_ns"] for task in report_a["per_task"])
+    synth_b = sum(task["synth_ns"] for task in report_b["per_task"])
+    assert synth_b <= synth_a
+    for task in report_b["per_task"]:
+        if task["warm_start_store"]:
+            assert task["synth_ns"] == 0
+            assert task["warm_start_candidate_hash"]
+            assert not task.get("warm_start_candidate_rejected", False)
+    fail_task = next(task for task in report_b["per_task"] if task["task_id"] == "bool_fail_01")
+    assert fail_task["verdict"] == "FAIL"
+
+
+def test_domain_warm_start_reuse(tmp_path: Path) -> None:
+    suite_file = tmp_path / "warm_domain_suite.json"
+    suite_payload = {
+        "suite_id": "warm_domain",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    cold_out = tmp_path / "warm_domain_cold"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(cold_out),
+        ],
+    )
+    assert result.exit_code == 0
+
+    manifest = read_json(cold_out / "store" / "manifest.json")
+    programs = manifest.get("programs", {})
+    arith_hash = next(
+        program_hash
+        for program_hash, entry in programs.items()
+        if entry.get("domain") == "arith"
+    )
+
+    settings = Settings(warm_start_store=str(cold_out / "store"))
+    run_dir = tmp_path / "arith_02_warm_store"
+    summary = episode_run(
+        task_file=Path("examples/tasks/arith_02.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+
+    assert summary["verdict"] == "PASS"
+    assert summary["warm_start_store"]
+    assert summary["synth_ns"] == 0
+    assert summary["warm_start_candidate_hash"] == arith_hash
+    assert not summary["warm_start_candidate_rejected"]
+
+
+def test_store_audit_cmd(tmp_path: Path) -> None:
+    suite_file = tmp_path / "store_suite.json"
+    suite_payload = {
+        "suite_id": "store_suite",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    out_dir = tmp_path / "store_suite_out"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+    store_dir = out_dir / "store"
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(store_dir)],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_bool_fail_warm_start_unsat(tmp_path: Path) -> None:
+    suite_file = tmp_path / "bool_suite.json"
+    suite_payload = {
+        "suite_id": "bool_suite",
+        "tasks": [
+            {"task_file": "examples/tasks/bool_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    out_dir = tmp_path / "bool_suite_out"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    store_path = out_dir / "store"
+    settings = Settings(warm_start_store=str(store_path))
+    run_dir = tmp_path / "bool_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/bool_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    assert summary["failure_reason"] == "EXAMPLE_CONTRADICT"
+    assert not summary["warm_start_store"]
+
+
+def test_suite_warm_start_store_persists(tmp_path: Path) -> None:
+    suite_a = tmp_path / "suite_a.json"
+    suite_a_payload = {
+        "suite_id": "suite_warm_store_a",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+        ],
+    }
+    suite_a.write_text(orjson.dumps(suite_a_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    out_a = tmp_path / "suite_warm_store_a"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_a),
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    suite_b = tmp_path / "suite_b.json"
+    suite_b_payload = {
+        "suite_id": "suite_warm_store_b",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_02.json"},
+        ],
+    }
+    suite_b.write_text(orjson.dumps(suite_b_payload).decode("utf-8"), encoding="utf-8")
+
+    out_b = tmp_path / "suite_warm_store_b"
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_b),
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+    report_b = read_json(out_b / "report.json")
+    arith_entry = next(
+        entry for entry in report_b["per_task"] if entry["task_id"] == "arith_02"
+    )
+    assert arith_entry["warm_start_store"]
+    assert arith_entry["synth_ns"] == 0
+    candidate_hash = arith_entry["warm_start_candidate_hash"]
+    assert candidate_hash
+    assert not arith_entry.get("warm_start_candidate_rejected", False)
+    manifest_b = read_json(out_b / "store" / "manifest.json")
+    assert candidate_hash in manifest_b.get("programs", {})
+def test_forge_admit_and_reject(tmp_path: Path) -> None:
+    store_root = Path("store") / "v1" / "arith"
+    if store_root.exists():
+        shutil.rmtree(store_root)
+    store_root.mkdir(parents=True, exist_ok=True)
+
+    settings = Settings()
+    pass_dir = tmp_path / "forge_pass"
+    summary_pass = episode_run(
+        task_file=Path("examples/tasks/arith_01.json"),
+        run_dir=pass_dir,
+        settings=settings,
+    )
+    ucr_pass = orjson.loads(Path(summary_pass["ucr_path"]).read_bytes())
+    program_hash = ucr_pass["hashes"]["program_hash"]
+    admitted_path = store_root / f"{program_hash}.json"
+    assert admitted_path.exists()
+
+    before_files = sorted(path.name for path in store_root.glob("*.json"))
+    fail_dir = tmp_path / "forge_fail"
+    episode_run(
+        task_file=Path("examples/tasks/arith_sealed_trap_01.json"),
+        run_dir=fail_dir,
+        settings=settings,
+    )
+    after_files = sorted(path.name for path in store_root.glob("*.json"))
+    assert before_files == after_files
 
 
 def test_sealed_withheld_failure_produces_capsule(tmp_path: Path) -> None:

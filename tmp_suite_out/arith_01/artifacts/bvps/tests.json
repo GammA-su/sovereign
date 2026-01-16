@@ -1,0 +1,1 @@
+{"counterexamples":[],"tests":[{"inputs":{"x":1,"y":2},"output":3},{"inputs":{"x":-1,"y":4},"output":3}]}

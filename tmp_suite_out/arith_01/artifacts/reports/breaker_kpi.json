@@ -1,0 +1,1 @@
+{"CDR":0.0,"NOVN":1.0,"TMR":0.0,"WFHR":0.0,"budget":{"attempt_budget":200},"canonicalization":"orjson_sort_keys_utf8","hash_algorithm":"blake3","hash_inputs":["schema_version","canonicalization","hash_algorithm","CDR","TMR","NOVN","WFHR","window","budget"],"schema_version":"v1","window":{"attempts":300}}

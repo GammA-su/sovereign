@@ -9,16 +9,30 @@ from ..artifact_store import ArtifactStore
 from ..bg.bg_engine import BGEngine, compute_context_hash
 from ..breaker.breaker import BreakerLab
 from ..bvps.cegis import CEGISResult, run_cegis
+from ..bvps.dsl import Program
+from ..bvps.interpreter import INTERPRETER_HASH, eval_program
 from ..config import Settings
 from ..forge.forge import ForgeGate
 from ..ledger.ledger import Ledger
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
-from ..utils import ensure_dir, read_jsonl, stable_hash, write_json
+from ..utils import (
+    canonical_dumps,
+    ensure_dir,
+    hash_bytes,
+    read_json,
+    read_jsonl,
+    stable_hash,
+    write_json,
+)
 from ..verify.lanes import VerifierContext
 from ..verify.verifier import required_lanes_passed, run_verifiers
 from .kernel import KernelStub
 from .specs import task_spec
 from .task import Task, load_task
+
+
+class ContradictoryExamplesError(RuntimeError):
+    pass
 
 
 def _init_run_dirs(run_dir: Path) -> None:
@@ -44,6 +58,36 @@ def _select_run_dir(run_dir: Path) -> Path:
         if not _ledger_has_run_start(candidate / "ledger.jsonl"):
             return candidate
     raise RuntimeError("Unable to select unique run_dir")
+
+
+def _load_store_candidate(
+    store_dir: Path, spec_signature: str, domain: str
+) -> tuple[Program, str] | None:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = read_json(manifest_path)
+    programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
+    domain_candidates: list[tuple[Program, str]] = []
+    for program_hash, entry in programs.items():
+        entry_domain = entry.get("domain", "")
+        if not entry_domain:
+            continue
+        program_path = Path(
+            entry.get("store_path", store_dir / entry_domain / f"{program_hash}.json")
+        )
+        if not program_path.exists():
+            continue
+        program_data = read_json(program_path)
+        program = Program.model_validate(program_data)
+        if entry.get("spec_signature") == spec_signature:
+            return program, program_hash
+        if entry_domain == domain:
+            domain_candidates.append((program, program_hash))
+    if domain_candidates:
+        domain_candidates.sort(key=lambda item: item[1])
+        return domain_candidates[0]
+    return None
 
 
 def _synth_failure_verdict(task: Task, reason: str) -> VerifierVerdict:
@@ -86,6 +130,11 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     active_view_hash = ""
     synth_cost = 0
     cegis_result: Optional[CEGISResult] = None
+    warm_start = False
+    warm_start_candidate_hash = ""
+    warm_start_candidate_rejected = False
+    warm_start_attempted = False
+    warm_start_successful = False
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -97,10 +146,45 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         interpretations_data = [interp.__dict__ for interp in interpretations]
         chosen_data = chosen.__dict__
 
+        if task.has_contradictory_examples():
+            failure_reason = "EXAMPLE_CONTRADICT"
+            raise ContradictoryExamplesError("contradictory examples in task")
+
+        spec_signature = task.spec_signature()
+        warm_start_program: tuple[Program, str] | None = None
+        if settings.warm_start_store:
+            store_candidate = _load_store_candidate(
+                Path(settings.warm_start_store), spec_signature, task.task_type
+            )
+            if store_candidate:
+                warm_start_program = store_candidate
+                warm_start_candidate_hash = store_candidate[1]
+
         rng_seed = settings.seed_for(run_dir.name)
-        start_synth = time.time_ns()
-        cegis_result = run_cegis(task, settings, rng_seed)
-        synth_cost = time.time_ns() - start_synth
+        if warm_start_program:
+            warm_start_attempted = True
+            program, program_hash = warm_start_program
+            tests = list(task.examples)
+            trace_hashes: List[str] = []
+            for example in tests:
+                _, trace_hash = eval_program(
+                    program, example.inputs, step_limit=settings.verify_budget_steps
+                )
+                trace_hashes.append(trace_hash)
+            cegis_result = CEGISResult(
+                status="ok",
+                program=program,
+                tests=tests,
+                counterexamples=[],
+                ast_hash=program_hash,
+                interpreter_hash=INTERPRETER_HASH,
+                trace_hashes=trace_hashes,
+            )
+            synth_cost = 0
+        else:
+            start_synth = time.time_ns()
+            cegis_result = run_cegis(task, settings, rng_seed)
+            synth_cost = time.time_ns() - start_synth
 
         artifacts.append(
             artifact_store.write_json(
@@ -125,6 +209,8 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         if cegis_result.status != "ok" or cegis_result.program is None:
             failure_reason = cegis_result.failure_reason or "SYNTH_FAIL"
             verdicts = [_synth_failure_verdict(task, failure_reason)]
+            if warm_start_attempted:
+                warm_start_candidate_rejected = True
         else:
             artifacts.append(
                 artifact_store.write_json(
@@ -176,7 +262,9 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             breaker_report = breaker_result.report
             breaker_kpi = breaker_result.kpi.model_dump()
 
-            required_pass = required_lanes_passed(verdicts, settings.required_lanes)
+            required_pass = required_lanes_passed(
+                verdicts, settings.admission_policy.required_lanes
+            )
             overall_verdict = "PASS" if required_pass else "FAIL"
             if not required_pass and not failure_reason:
                 failure_reason = "REQUIRED_LANES_FAIL"
@@ -193,17 +281,74 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 if not failure_reason:
                     failure_reason = "BREAKER_WITHHELD_FAIL"
 
+            if warm_start_attempted:
+                if required_pass:
+                    warm_start_successful = True
+                else:
+                    warm_start_candidate_rejected = True
+
+            if not witness_id:
+                witness_id = stable_hash(
+                    {
+                        "run_id": run_dir.name,
+                        "task_id": task.task_id,
+                        "failure_reason": failure_reason,
+                        "program_hash": cegis_result.ast_hash,
+                    }
+                )
+
             forge = ForgeGate()
-            decision = forge.decide(task, cegis_result.program, verdicts, required_pass)
+            controller_overhead_ratio = 0.0
+            withheld_hits = int(breaker_result.report.get("withheld_hits", 0))
+            decision = forge.decide(
+                task,
+                cegis_result.program,
+                verdicts,
+                required_pass,
+                settings.admission_policy,
+                controller_overhead_ratio,
+                withheld_hits,
+            )
             ledger.append(
                 "FORGE_DECISION",
                 {"decision": decision.decision, "reason": decision.reason},
             )
 
-            if decision.decision in {"QUARANTINE", "ROLLBACK"}:
+            decision_payload = {
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "witness_id": witness_id,
+                "program_hash": cegis_result.ast_hash,
+            }
+            decision_path = run_dir / "forge" / "decision.json"
+            write_json(decision_path, decision_payload)
+
+            if decision.decision == "ADMIT":
+                store_dir = Path("store") / "v1" / task.task_type
+                ensure_dir(store_dir)
+                program_bytes = canonical_dumps(cegis_result.program.to_json())
+                store_path = store_dir / f"{cegis_result.ast_hash}.json"
+                store_path.write_bytes(program_bytes)
+                content_hash = hash_bytes(program_bytes)
                 ledger.append(
-                    "FORGE_DECISION",
-                    {"decision": decision.decision, "reason": decision.reason},
+                    "FORGE_ADMIT",
+                    {
+                        "path": str(store_path),
+                        "content_hash": content_hash,
+                        "bytes": len(program_bytes),
+                        "witness_id": witness_id,
+                        "domain": task.task_type,
+                    },
+                )
+            elif decision.decision == "REJECT":
+                ledger.append(
+                    "FORGE_REJECT",
+                    {"reason": decision.reason, "witness_id": witness_id},
+                )
+            elif decision.decision in {"QUARANTINE", "ROLLBACK"}:
+                ledger.append(
+                    "FORGE_REJECT",
+                    {"reason": decision.reason, "witness_id": witness_id},
                 )
 
     except Exception:  # noqa: BLE001
@@ -224,15 +369,17 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         verdicts = verdicts or [_synth_failure_verdict(task, failure_reason)]
 
     task_id = task.task_id if task else "unknown"
-    witness_id = stable_hash(
-        {
-            "run_id": run_dir.name,
-            "task_id": task_id,
-            "failure_reason": failure_reason,
-            "program_hash": cegis_result.ast_hash if cegis_result else "",
-        }
-    )
+    if not witness_id:
+        witness_id = stable_hash(
+            {
+                "run_id": run_dir.name,
+                "task_id": task_id,
+                "failure_reason": failure_reason,
+                "program_hash": cegis_result.ast_hash if cegis_result else "",
+            }
+        )
 
+    warm_start = warm_start_successful
     witness = WitnessPacket(
         witness_id=witness_id,
         overall_verdict=overall_verdict,
@@ -326,6 +473,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             "run_id": run_dir.name,
             "verdict": overall_verdict,
             "active_view_hash": active_view_hash,
+            "witness_id": witness_id,
         },
     )
 
@@ -336,4 +484,9 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         "witness_path": str(witness_path),
         "ucr_path": str(ucr_path),
         "active_view_hash": active_view_hash,
+        "warm_start_store": warm_start,
+        "warm_start_candidate_hash": warm_start_candidate_hash,
+        "warm_start_candidate_rejected": warm_start_candidate_rejected,
+        "synth_ns": synth_cost,
+        "failure_reason": failure_reason,
     }

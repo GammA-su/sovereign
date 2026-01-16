@@ -1,0 +1,31 @@
+{
+  "task_id": "bool_fail_01",
+  "family": "bool",
+  "task_type": "bool",
+  "goal": "and",
+  "inputs": {
+    "a": "Bool",
+    "b": "Bool"
+  },
+  "output": "Bool",
+  "bounds": {},
+  "examples": [
+    {
+      "inputs": {
+        "a": true,
+        "b": true
+      },
+      "output": true
+    },
+    {
+      "inputs": {
+        "a": true,
+        "b": true
+      },
+      "output": false
+    }
+  ],
+  "metadata": {
+    "description": "Contradictory bool examples to force UNSAT."
+  }
+}

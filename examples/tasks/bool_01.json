@@ -1,0 +1,45 @@
+{
+  "task_id": "bool_01",
+  "family": "bool",
+  "task_type": "bool",
+  "goal": "and",
+  "inputs": {
+    "a": "Bool",
+    "b": "Bool"
+  },
+  "output": "Bool",
+  "bounds": {},
+  "examples": [
+    {
+      "inputs": {
+        "a": false,
+        "b": false
+      },
+      "output": false
+    },
+    {
+      "inputs": {
+        "a": false,
+        "b": true
+      },
+      "output": false
+    },
+    {
+      "inputs": {
+        "a": true,
+        "b": false
+      },
+      "output": false
+    },
+    {
+      "inputs": {
+        "a": true,
+        "b": true
+      },
+      "output": true
+    }
+  ],
+  "metadata": {
+    "description": "Bool AND truth table."
+  }
+}

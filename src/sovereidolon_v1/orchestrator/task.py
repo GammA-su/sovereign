@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from ..utils import read_json
+from ..utils import canonical_dumps, read_json, stable_hash
 
 
 class Example(BaseModel):
@@ -43,6 +43,28 @@ class Task(BaseModel):
             "examples": [example.model_dump() for example in self.examples],
             "metadata": self.metadata,
         }
+
+    def spec_signature(self) -> str:
+        payload = {
+            "task_type": self.task_type,
+            "goal": self.goal,
+            "inputs": self.inputs,
+            "output": self.output,
+            "bounds": self.bounds,
+            "examples": [example.model_dump() for example in self.examples],
+        }
+        return stable_hash(payload)
+
+    def has_contradictory_examples(self) -> bool:
+        seen: dict[str, Any] = {}
+        for example in self.examples:
+            key = canonical_dumps(example.inputs).decode("utf-8")
+            if key in seen:
+                if seen[key] != example.output:
+                    return True
+            else:
+                seen[key] = example.output
+        return False
 
 
 def load_task(path: Path) -> Task:

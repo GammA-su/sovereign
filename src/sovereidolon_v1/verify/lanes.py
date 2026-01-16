@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any, Dict, List, Literal
 
@@ -66,23 +67,66 @@ def _hypothesis_inputs(task: Task, count: int, seed_value: int) -> List[Dict[str
 
         _collect()
         return inputs
+    if task.task_type == "bool":
+        return _bool_inputs(task)
     return []
+
+
+def _bool_inputs(task: Task) -> List[Dict[str, Any]]:
+    names = list(task.inputs.keys())
+    combos = product([False, True], repeat=len(names))
+    inputs: List[Dict[str, Any]] = []
+    for combo in combos:
+        inputs.append({name: bool(value) for name, value in zip(names, combo, strict=True)})
+    return inputs
 
 
 def recompute_lane(ctx: VerifierContext) -> VerifierVerdict:
     start = time.time_ns()
     failure_atoms: List[str] = []
-    for example in ctx.tests:
-        value1, trace1 = eval_program(ctx.program, example.inputs, ctx.settings.verify_budget_steps)
-        value2, trace2 = eval_program(ctx.program, example.inputs, ctx.settings.verify_budget_steps)
-        if value1 != example.output:
-            failure_atoms.append("recompute_output_mismatch")
-            break
-        if trace1 != trace2:
-            failure_atoms.append("trace_nondeterministic")
-            break
+    if ctx.task.has_contradictory_examples():
+        failure_atoms.append("contradictory_examples")
+        cost = {"ns": time.time_ns() - start, "tests": 0}
+        return VerifierVerdict(
+            verdict="FAIL",
+            failure_atoms=failure_atoms,
+            domain="bvps",
+            tier="recompute",
+            bounds=ctx.task.bounds,
+            soundness_grade="CERT",
+            metamorphic_families=[],
+            cost=cost,
+        )
+    test_count = len(ctx.tests)
+    if ctx.task.task_type == "bool":
+        inputs = _bool_inputs(ctx.task)
+        test_count = len(inputs)
+        for inp in inputs:
+            expected = ctx.spec.evaluate(inp)
+            value1, trace1 = eval_program(ctx.program, inp, ctx.settings.verify_budget_steps)
+            value2, trace2 = eval_program(ctx.program, inp, ctx.settings.verify_budget_steps)
+            if value1 != expected:
+                failure_atoms.append("recompute_output_mismatch")
+                break
+            if trace1 != trace2:
+                failure_atoms.append("trace_nondeterministic")
+                break
+    else:
+        for example in ctx.tests:
+            value1, trace1 = eval_program(
+                ctx.program, example.inputs, ctx.settings.verify_budget_steps
+            )
+            value2, trace2 = eval_program(
+                ctx.program, example.inputs, ctx.settings.verify_budget_steps
+            )
+            if value1 != example.output:
+                failure_atoms.append("recompute_output_mismatch")
+                break
+            if trace1 != trace2:
+                failure_atoms.append("trace_nondeterministic")
+                break
     verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
-    cost = {"ns": time.time_ns() - start, "tests": len(ctx.tests)}
+    cost = {"ns": time.time_ns() - start, "tests": test_count}
     return VerifierVerdict(
         verdict=verdict,
         failure_atoms=failure_atoms,

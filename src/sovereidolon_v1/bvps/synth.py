@@ -90,6 +90,53 @@ def program_true(task: Task) -> Program:
     )
 
 
+def program_false(task: Task) -> Program:
+    return Program(
+        name="false",
+        arg_types=task.inputs,
+        return_type=task.output,
+        body=lit_bool(False),
+    )
+
+
+def _bool_not(expr: dict) -> dict:
+    return if_expr(expr, lit_bool(False), lit_bool(True))
+
+
+def program_and(task: Task) -> Program:
+    arg_names = list(task.inputs.keys())
+    return Program(
+        name="and",
+        arg_types=task.inputs,
+        return_type=task.output,
+        body=binop("and", var(arg_names[0]), var(arg_names[1])),
+    )
+
+
+def program_or(task: Task) -> Program:
+    arg_names = list(task.inputs.keys())
+    return Program(
+        name="or",
+        arg_types=task.inputs,
+        return_type=task.output,
+        body=binop("or", var(arg_names[0]), var(arg_names[1])),
+    )
+
+
+def program_xor(task: Task) -> Program:
+    arg_names = list(task.inputs.keys())
+    a_expr = var(arg_names[0])
+    b_expr = var(arg_names[1])
+    left = binop("and", a_expr, _bool_not(b_expr))
+    right = binop("and", _bool_not(a_expr), b_expr)
+    return Program(
+        name="xor",
+        arg_types=task.inputs,
+        return_type=task.output,
+        body=binop("or", left, right),
+    )
+
+
 def candidate_programs(task: Task) -> Iterable[Program]:
     if task.task_type == "arith":
         if task.goal == "add":
@@ -105,6 +152,32 @@ def candidate_programs(task: Task) -> Iterable[Program]:
         return [program_identity(task)]
     if task.task_type == "bg":
         return [program_true(task)]
+    if task.task_type == "bool":
+        if task.goal == "and":
+            return [
+                program_and(task),
+                program_or(task),
+                program_xor(task),
+                program_true(task),
+                program_false(task),
+            ]
+        if task.goal == "or":
+            return [
+                program_or(task),
+                program_and(task),
+                program_xor(task),
+                program_true(task),
+                program_false(task),
+            ]
+        if task.goal == "xor":
+            return [
+                program_xor(task),
+                program_and(task),
+                program_or(task),
+                program_true(task),
+                program_false(task),
+            ]
+        return [program_true(task), program_false(task)]
     return [program_identity(task)]
 
 

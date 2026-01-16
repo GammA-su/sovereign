@@ -30,6 +30,17 @@ class TaskSpec:
             raise ValueError("unknown list goal")
         if self.task.task_type == "bg":
             return True
+        if self.task.task_type == "bool":
+            arg_names = list(self.task.inputs.keys())
+            a_val = bool(inputs[arg_names[0]])
+            b_val = bool(inputs[arg_names[1]])
+            if self.task.goal == "and":
+                return a_val and b_val
+            if self.task.goal == "or":
+                return a_val or b_val
+            if self.task.goal == "xor":
+                return (a_val and not b_val) or (not a_val and b_val)
+            raise ValueError("unknown bool goal")
         raise ValueError("unknown task type")
 
     def random_inputs(self, rng: random.Random) -> Dict[str, Any]:
@@ -49,6 +60,11 @@ class TaskSpec:
             }
         if self.task.task_type == "bg":
             return {"state": {}}
+        if self.task.task_type == "bool":
+            inputs: Dict[str, Any] = {}
+            for name in self.task.inputs.keys():
+                inputs[name] = bool(rng.randint(0, 1))
+            return inputs
         raise ValueError("unknown task type")
 
     def generate_inputs(self, count: int, seed: int) -> Iterable[Dict[str, Any]]:
