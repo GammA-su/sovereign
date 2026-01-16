@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, List, Optional
 
 from ..config import Settings
 from ..orchestrator.specs import task_spec
@@ -13,12 +13,14 @@ from .synth import candidate_programs
 
 @dataclass
 class CEGISResult:
-    program: Any
+    status: str
+    program: Optional[Any]
     tests: List[Example]
     counterexamples: List[Example]
     ast_hash: str
     interpreter_hash: str
     trace_hashes: List[str]
+    failure_reason: str = ""
 
 
 def _passes_tests(program: Any, tests: List[Example], step_limit: int) -> bool:
@@ -56,6 +58,7 @@ def run_cegis(task: Task, settings: Settings, rng_seed: int) -> CEGISResult:
             trace_hashes.append(trace_hash)
         ast_hash = stable_hash(program.to_json())
         return CEGISResult(
+            status="ok",
             program=program,
             tests=tests,
             counterexamples=counterexamples,
@@ -64,4 +67,13 @@ def run_cegis(task: Task, settings: Settings, rng_seed: int) -> CEGISResult:
             trace_hashes=trace_hashes,
         )
 
-    raise RuntimeError("CEGIS failed to synthesize")
+    return CEGISResult(
+        status="fail",
+        program=None,
+        tests=tests,
+        counterexamples=counterexamples,
+        ast_hash="",
+        interpreter_hash=INTERPRETER_HASH,
+        trace_hashes=trace_hashes,
+        failure_reason="CEGIS_UNSAT",
+    )

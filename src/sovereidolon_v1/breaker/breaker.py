@@ -119,32 +119,67 @@ class BreakerLab:
         budget: int,
         seed: int,
     ) -> BreakerResult:
+        if task.task_type not in {"arith", "list"}:
+            kpi = BreakerKPI(
+                CDR=0.0,
+                TMR=0.0,
+                NOVN=0.0,
+                WFHR=0.0,
+                window={"attempts": 0},
+                budget={"attempt_budget": budget},
+            )
+            report_data: Dict[str, Any] = {
+                "counterexample": None,
+                "minimized": None,
+                "attempts": 0,
+                "skipped": True,
+            }
+            return BreakerResult(counterexample=None, minimized=None, kpi=kpi, report=report_data)
+
         rng = random.Random(seed)
         start = time.time_ns()
         attempts = 0
         found: Optional[Example] = None
         minimized: Optional[Example] = None
-        withheld_families = list(self.settings.withheld_families)
+        if task.sealed and task.sealed.withheld_families:
+            withheld_families = list(task.sealed.withheld_families)
+        else:
+            withheld_families = list(self.settings.withheld_families)
         withheld_hits = 0
         withheld_trials = 0
 
         bases = [example.inputs for example in tests]
         families = ["permute", "duplicate", "scale", "shift"]
 
-        for _ in range(budget):
+        for family in withheld_families:
+            if attempts >= budget:
+                break
             attempts += 1
             base = rng.choice(bases)
-            family = rng.choice(families)
             mutated = _mutate_inputs(base, family, rng)
             expected = spec.evaluate(mutated)
             actual, _ = eval_program(program, mutated, self.settings.verify_budget_steps)
-            if family in withheld_families:
-                withheld_trials += 1
-                if expected != actual:
-                    withheld_hits += 1
+            withheld_trials += 1
             if expected != actual:
+                withheld_hits += 1
                 found = Example(inputs=mutated, output=expected)
                 break
+
+        if found is None:
+            for _ in range(budget - attempts):
+                attempts += 1
+                base = rng.choice(bases)
+                family = rng.choice(families)
+                mutated = _mutate_inputs(base, family, rng)
+                expected = spec.evaluate(mutated)
+                actual, _ = eval_program(program, mutated, self.settings.verify_budget_steps)
+                if family in withheld_families:
+                    withheld_trials += 1
+                    if expected != actual:
+                        withheld_hits += 1
+                if expected != actual:
+                    found = Example(inputs=mutated, output=expected)
+                    break
 
         if found is None:
             for _ in range(budget // 2):
@@ -180,7 +215,7 @@ class BreakerLab:
             window={"attempts": attempts},
             budget={"attempt_budget": budget},
         )
-        report = {
+        report: Dict[str, Any] = {
             "counterexample": found.model_dump() if found else None,
             "minimized": minimized.model_dump() if minimized else None,
             "attempts": attempts,

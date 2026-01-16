@@ -28,6 +28,8 @@ class TaskSpec:
             if self.task.goal == "max":
                 return int(max(xs)) if xs else 0
             raise ValueError("unknown list goal")
+        if self.task.task_type == "bg":
+            return True
         raise ValueError("unknown task type")
 
     def random_inputs(self, rng: random.Random) -> Dict[str, Any]:
@@ -45,6 +47,8 @@ class TaskSpec:
             return {
                 "xs": [rng.randint(int(elem_min), int(elem_max)) for _ in range(length)]
             }
+        if self.task.task_type == "bg":
+            return {"state": {}}
         raise ValueError("unknown task type")
 
     def generate_inputs(self, count: int, seed: int) -> Iterable[Dict[str, Any]]:

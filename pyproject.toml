@@ -23,6 +23,7 @@ sovereidolon = "sovereidolon_v1.cli:app"
 line-length = 100
 target-version = "py311"
 fix = false
+extend-exclude = [".hypothesis"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]

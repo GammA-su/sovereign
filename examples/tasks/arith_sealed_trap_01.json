@@ -1,0 +1,40 @@
+{
+  "task_id": "arith_sealed_trap_01",
+  "family": "arith",
+  "task_type": "arith",
+  "goal": "mul",
+  "inputs": {
+    "x": "Int",
+    "y": "Int"
+  },
+  "output": "Int",
+  "bounds": {
+    "x": [
+      1,
+      1
+    ],
+    "y": [
+      1,
+      1
+    ]
+  },
+  "examples": [
+    {
+      "inputs": {
+        "x": 1,
+        "y": 1
+      },
+      "output": 1
+    }
+  ],
+  "metadata": {
+    "description": "Sealed trap: passes training but fails withheld scale mutation."
+  },
+  "sealed": {
+    "sealed_seed": 1337,
+    "withheld_families": [
+      "scale"
+    ],
+    "canary_token": "CANARY_TRAP"
+  }
+}

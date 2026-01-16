@@ -204,6 +204,8 @@ class ArtifactRecord(HashableModel):
 
 class WitnessPacket(HashableModel):
     witness_id: str
+    overall_verdict: Literal["PASS", "FAIL"]
+    failure_reason: str = ""
     artifacts: List[ArtifactRecord] = Field(default_factory=list)
     verifier_verdicts: List[VerifierVerdict] = Field(default_factory=list)
     breaker_evidence: Dict[str, Any] = Field(default_factory=dict)
@@ -220,6 +222,8 @@ class WitnessPacket(HashableModel):
                 "canonicalization",
                 "hash_algorithm",
                 "witness_id",
+                "overall_verdict",
+                "failure_reason",
                 "artifacts",
                 "verifier_verdicts",
                 "breaker_evidence",
@@ -240,6 +244,8 @@ class UCR(HashableModel):
     solver_trace: List[str] = Field(default_factory=list)
     costs: Dict[str, int] = Field(default_factory=dict)
     hashes: Dict[str, str] = Field(default_factory=dict)
+    bg_context: Dict[str, Any] = Field(default_factory=dict)
+    active_view_hash: str = ""
     run_metadata: Dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -257,6 +263,8 @@ class UCR(HashableModel):
                 "solver_trace",
                 "costs",
                 "hashes",
+                "bg_context",
+                "active_view_hash",
                 "run_metadata",
             ]
         return self

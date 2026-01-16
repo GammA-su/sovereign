@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable, List
 
 from ..orchestrator.task import Task
-from .dsl import Program, binop, fold_list, if_expr, lit_int, var
+from .dsl import Program, binop, fold_list, if_expr, lit_bool, lit_int, var
 
 
 def _list_bound(task: Task, default: int = 10) -> int:
@@ -81,6 +81,15 @@ def program_list_max(task: Task) -> Program:
     )
 
 
+def program_true(task: Task) -> Program:
+    return Program(
+        name="true",
+        arg_types=task.inputs,
+        return_type=task.output,
+        body=lit_bool(True),
+    )
+
+
 def candidate_programs(task: Task) -> Iterable[Program]:
     if task.task_type == "arith":
         if task.goal == "add":
@@ -94,6 +103,8 @@ def candidate_programs(task: Task) -> Iterable[Program]:
         if task.goal == "max":
             return [program_identity(task), program_list_max(task)]
         return [program_identity(task)]
+    if task.task_type == "bg":
+        return [program_true(task)]
     return [program_identity(task)]
 
 

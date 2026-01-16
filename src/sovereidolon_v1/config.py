@@ -5,6 +5,8 @@ from typing import List
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .utils import stable_hash
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SOVEREIDOLON_")
@@ -24,4 +26,5 @@ class Settings(BaseSettings):
     controller_overhead_threshold: float = 0.2
 
     def seed_for(self, run_id: str) -> int:
-        return abs(hash((run_id, self.open_seed))) % (2**32)
+        digest = stable_hash({"run_id": run_id, "seed": self.open_seed})
+        return int(digest[:8], 16)
