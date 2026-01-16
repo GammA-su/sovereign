@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -433,6 +434,33 @@ def store_audit_cmd(
         raise typer.Exit(code=1)
 
 
+def normalize_suite_report(report: dict[str, Any]) -> dict[str, Any]:
+    r = copy.deepcopy(report)
+    for t in r.get("per_task", []):
+        t.pop("synth_ns", None)
+        t.pop("active_view_hash", None)
+        fd = t.get("forge_decision")
+        if isinstance(fd, dict):
+            fd.pop("witness_id", None)
+            t["forge_decision"] = fd
+    for u in r.get("store_updates", []):
+        sp = u.get("store_path")
+        if isinstance(sp, str):
+            sp = sp.replace("\\", "/")
+            marker = "/store/"
+            if marker in sp:
+                u["store_path"] = "store/" + sp.split(marker, 1)[1]
+            else:
+                u.pop("store_path", None)
+    return r
+
+
+def ensure_trailing_newline(path: Path) -> None:
+    data = path.read_bytes()
+    if not data.endswith(b"\n"):
+        path.write_bytes(data + b"\n")
+
+
 @suite_app.command("run")
 def suite_run_cmd(
     suite_file: Path = SUITE_FILE_OPTION,
@@ -502,6 +530,7 @@ def suite_run_cmd(
                 "warm_start_candidate_rejected": summary.get(
                     "warm_start_candidate_rejected", False
                 ),
+                "warm_start_provided": summary.get("warm_start_provided", False),
             }
         )
         if summary["verdict"] == "PASS":
@@ -578,6 +607,11 @@ def suite_run_cmd(
     }
     report_path = report_dir / "report.json"
     write_json(report_path, report)
+    ensure_trailing_newline(report_path)
+    norm_report = normalize_suite_report(report)
+    norm_path = report_dir / "report.norm.json"
+    write_json(norm_path, norm_report)
+    ensure_trailing_newline(norm_path)
     console.print({"report": str(report_path)})
 
 

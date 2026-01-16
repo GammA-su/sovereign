@@ -135,6 +135,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     warm_start_candidate_rejected = False
     warm_start_attempted = False
     warm_start_successful = False
+    warm_start_provided = bool(settings.warm_start_store)
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -484,6 +485,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         "witness_path": str(witness_path),
         "ucr_path": str(ucr_path),
         "active_view_hash": active_view_hash,
+        "warm_start_provided": warm_start_provided,
         "warm_start_store": warm_start,
         "warm_start_candidate_hash": warm_start_candidate_hash,
         "warm_start_candidate_rejected": warm_start_candidate_rejected,

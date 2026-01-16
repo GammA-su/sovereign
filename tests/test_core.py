@@ -16,6 +16,7 @@ from sovereidolon_v1.cli import (
     audit_run,
     bg_replay_cmd,
     migrate_run,
+    normalize_suite_report,
     verify_bg_replay,
 )
 from sovereidolon_v1.config import Settings
@@ -510,6 +511,38 @@ def test_suite_run_reports(tmp_path: Path) -> None:
     assert any(entry.get("admitted_count", 0) > 1 for entry in programs.values())
 
 
+def test_suite_report_norm_written(tmp_path: Path) -> None:
+    suite_file = tmp_path / "suite_norm.json"
+    suite_payload = {
+        "suite_id": "norm_suite",
+        "tasks": [
+            {"task_file": "examples/tasks/arith_01.json"},
+            {"task_file": "examples/tasks/bool_01.json"},
+        ],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_norm"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+    report = read_json(out_dir / "report.json")
+    norm = read_json(out_dir / "report.norm.json")
+    assert norm == normalize_suite_report(report)
+    text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert text.endswith("\n")
+
+
 def test_suite_warm_start(tmp_path: Path) -> None:
     suite_file = tmp_path / "suite.json"
     suite_payload = {
@@ -742,12 +775,17 @@ def test_suite_warm_start_store_persists(tmp_path: Path) -> None:
         entry for entry in report_b["per_task"] if entry["task_id"] == "arith_02"
     )
     assert arith_entry["warm_start_store"]
+    assert arith_entry["warm_start_provided"]
     assert arith_entry["synth_ns"] == 0
     candidate_hash = arith_entry["warm_start_candidate_hash"]
     assert candidate_hash
     assert not arith_entry.get("warm_start_candidate_rejected", False)
     manifest_b = read_json(out_b / "store" / "manifest.json")
     assert candidate_hash in manifest_b.get("programs", {})
+    warm_store_file = out_b / "store" / "arith" / f"{candidate_hash}.json"
+    assert warm_store_file.exists()
+    manifest_entry = manifest_b["programs"][candidate_hash]
+    assert Path(manifest_entry["store_path"]) == warm_store_file
 def test_forge_admit_and_reject(tmp_path: Path) -> None:
     store_root = Path("store") / "v1" / "arith"
     if store_root.exists():
