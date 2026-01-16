@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/orchestrator/kernel.py
+# hypothesis_version: 6.150.2
+
+['Compute x * y', 'Compute x + y', 'Max of list elements', 'Sum list elements', 'Task-specific', 'action', 'add', 'arith', 'goal', 'list', 'max', 'mul', 'noop', 'reason', 'stub', 'sum']

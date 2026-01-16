@@ -1,0 +1,26 @@
+{
+  "task_id": "list_01",
+  "family": "list",
+  "task_type": "list",
+  "goal": "sum",
+  "inputs": {
+    "xs": "List[Int]"
+  },
+  "output": "Int",
+  "bounds": {
+    "xs_len": [0, 6],
+    "xs_elem": [-5, 5]
+  },
+  "examples": [
+    {"inputs": {"xs": [1, 2, 3]}, "output": 6},
+    {"inputs": {"xs": []}, "output": 0}
+  ],
+  "metadata": {
+    "description": "sum list"
+  },
+  "sealed": {
+    "canary_token": "CANARY_LIST",
+    "sealed_seed": 456,
+    "withheld_families": ["scale"]
+  }
+}

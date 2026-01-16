@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/orchestrator/specs.py
+# hypothesis_version: 6.150.2
+
+['add', 'arith', 'list', 'max', 'mul', 'sum', 'unknown arith goal', 'unknown list goal', 'unknown task type', 'x', 'xs', 'xs_elem', 'xs_len', 'y']

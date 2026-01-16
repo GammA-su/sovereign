@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/artifact_store.py
+# hypothesis_version: 6.150.2
+
+['ARTIFACT_WRITTEN', 'bytes', 'content_hash', 'kind', 'path', 'utf-8']

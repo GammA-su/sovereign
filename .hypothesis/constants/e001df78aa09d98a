@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/ledger/ledger.py
+# hypothesis_version: 6.150.2
+
+['hash', 'ok', 'payload', 'prev_hash', 'ts', 'type']

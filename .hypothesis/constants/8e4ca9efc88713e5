@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/verify/lanes.py
+# hypothesis_version: 6.150.2
+
+['*', '+', '-', '<', '<=', '==', '>', '>=', 'BOUNDED', 'CERT', 'FAIL', 'HEURISTIC', 'PASS', 'acc', 'anchor', 'and', 'arith', 'binop', 'body', 'bool', 'bvps', 'cond', 'consequence', 'duplicate', 'elements', 'else', 'fold', 'if', 'init', 'int', 'kind', 'ledger.jsonl', 'ledger_tamper', 'left', 'let', 'list', 'map', 'name', 'ns', 'op', 'or', 'property_violation', 'recompute', 'reverse', 'right', 'samples', 'system', 'tests', 'then', 'transfer', 'transfer_violation', 'translation', 'translation_mismatch', 'tuple2', 'unknown expr kind', 'unknown op', 'value', 'var', 'x', 'xs', 'xs_elem', 'xs_len', 'y']

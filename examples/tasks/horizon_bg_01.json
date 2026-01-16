@@ -1,0 +1,22 @@
+{
+  "task_id": "horizon_bg_01",
+  "family": "bg",
+  "task_type": "bg",
+  "goal": "state_consistency",
+  "inputs": {
+    "state": "Map"
+  },
+  "output": "Bool",
+  "bounds": {},
+  "examples": [
+    {"inputs": {"state": {"a": 1}}, "output": true}
+  ],
+  "metadata": {
+    "description": "BG horizon demo"
+  },
+  "sealed": {
+    "canary_token": "CANARY_BG",
+    "sealed_seed": 789,
+    "withheld_families": []
+  }
+}

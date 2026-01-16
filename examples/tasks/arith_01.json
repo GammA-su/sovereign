@@ -1,0 +1,27 @@
+{
+  "task_id": "arith_01",
+  "family": "arith",
+  "task_type": "arith",
+  "goal": "add",
+  "inputs": {
+    "x": "Int",
+    "y": "Int"
+  },
+  "output": "Int",
+  "bounds": {
+    "x": [-10, 10],
+    "y": [-10, 10]
+  },
+  "examples": [
+    {"inputs": {"x": 1, "y": 2}, "output": 3},
+    {"inputs": {"x": -1, "y": 4}, "output": 3}
+  ],
+  "metadata": {
+    "description": "simple add"
+  },
+  "sealed": {
+    "canary_token": "CANARY_ADD",
+    "sealed_seed": 123,
+    "withheld_families": ["permute"]
+  }
+}

@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/orchestrator/episode.py
+# hypothesis_version: 6.150.2
+
+['BREAKER_RESULT', 'FAIL', 'FORGE_DECISION', 'PASS', 'PROMOTE', 'QUARANTINE', 'ROLLBACK', 'RUN_END', 'RUN_START', 'UCR_WRITTEN', 'VERIFIER_RESULT', 'WITNESS_WRITTEN', 'active_view_hash', 'artifacts', 'bg', 'breaker_kpi', 'breaker_report', 'bvps', 'bvps/program.json', 'bvps/tests.json', 'bvps_program', 'bvps_tests', 'bvps_traces', 'capsules', 'counterexamples', 'decision', 'interpreter', 'kpi', 'ledger.jsonl', 'path', 'policy', 'policy_version', 'program', 'program_hash', 'reason', 'report', 'reports', 'reports/breaker.json', 'revisions.jsonl', 'run_dir', 'run_id', 'synth_ns', 'task', 'task_file', 'task_id', 'tests', 'trace_hashes', 'ucr.json', 'ucr_hash', 'ucr_path', 'verdict', 'verifier_lanes', 'verifier_report', 'witness_id', 'witness_path', 'witnesses']

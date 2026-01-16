@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/config.py
+# hypothesis_version: 6.150.2
+
+[0.2, 200, 500, 1337, 4242, 'SOVEREIDOLON_', 'anchor', 'consequence', 'permute', 'recompute', 'scale', 'translation', 'v1']

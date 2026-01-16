@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/cli.py
+# hypothesis_version: 6.150.2
+
+['--config', '--context', '--out-dir', '--policy-version', '--run-dir', '--run-id', '--task-file', 'BG demo placeholder', 'Demos', 'Episode Summary', 'Episode commands', 'Field', 'Ledger commands', 'SOVEREIDOLON v1 CLI', 'Schema utilities', 'Value', '__main__', 'active_nodes', 'active_view_hash', 'bg', 'bg_demo.json', 'breaker', 'breaker_demo.json', 'cost', 'cost_demo.json', 'demo', 'demo_bg', 'demo_breaker', 'demo_cost', 'episode', 'export', 'ledger', 'ledger.jsonl', 'message', 'note', 'ok', 'replay', 'report', 'reports', 'revisions.jsonl', 'run', 'run_id', 'runs', 'schema', 'schemas', 'task_id', 'utf-8', 'v1', 'verify']

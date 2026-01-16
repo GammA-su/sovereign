@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/breaker/breaker.py
+# hypothesis_version: 6.150.2
+
+[0.0, 1.0, 1000000000.0, 'attempt_budget', 'attempts', 'capsules', 'counterexample', 'duplicate', 'duration_ns', 'fingerprint', 'minimized', 'novelty.jsonl', 'permute', 'scale', 'shift', 'withheld_hits', 'withheld_trials', 'x', 'xs', 'y']

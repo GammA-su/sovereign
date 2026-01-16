@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/bvps/dsl.py
+# hypothesis_version: 6.150.2
+
+['acc', 'binop', 'body', 'bool', 'bound', 'cond', 'elements', 'else', 'fold', 'if', 'init', 'int', 'kind', 'left', 'let', 'list', 'map', 'name', 'op', 'right', 'then', 'tuple2', 'value', 'var']

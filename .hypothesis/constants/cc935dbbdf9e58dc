@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/bvps/synth.py
+# hypothesis_version: 6.150.2
+
+['*', '+', '>', 'acc', 'add', 'arith', 'identity', 'list', 'list_len', 'max', 'mul', 'sum', 'x', 'xs', 'xs_len']

@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/forge/forge.py
+# hypothesis_version: 6.150.2
+
+['ASSERT', 'HEURISTIC', 'PASS', 'PROMOTE', 'QUARANTINE', 'REJECT', 'RETRACT', 'canary_echo', 'family_disjoint', 'heuristic_only', 'passes', 'reject', 'witness']

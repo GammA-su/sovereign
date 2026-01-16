@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/bg/bg_engine.py
+# hypothesis_version: 6.150.2
+
+['.', '/dev/null', 'ASSERT', 'BG_OP_APPLIED', 'DECLARE_CONFLICT', 'PATCH', 'RESOLVE_CONFLICT', 'RETRACT', 'SUPERSEDE', 'Unknown conflict_id', 'Unknown node_id', 'Unknown old_id', 'Unknown op', 'active_nodes', 'base', 'bg', 'chosen', 'conflict_id', 'conflict_id required', 'conflicts', 'context_hash', 'diff', 'members', 'new_id', 'node_id', 'node_id required', 'old_id', 'old_id required', 'op', 'policy_version', 'revisions.jsonl', 'witness_id']

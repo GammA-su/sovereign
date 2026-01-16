@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/orchestrator/task.py
+# hypothesis_version: 6.150.2
+
+['bounds', 'examples', 'family', 'goal', 'inputs', 'metadata', 'output', 'task_id', 'task_type']

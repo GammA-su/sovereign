@@ -1,0 +1,4 @@
+# file: /workspace/sovereign/src/sovereidolon_v1/bvps/interpreter.py
+# hypothesis_version: 6.150.2
+
+[500, 1000, '*', '+', '-', '<', '<=', '==', '>', '>=', 'acc', 'and', 'binop', 'body', 'bool', 'bound', 'bvps', 'cond', 'dsl', 'elements', 'else', 'env', 'fold', 'fold bound exceeded', 'fold expects list', 'if', 'init', 'int', 'kind', 'left', 'let', 'list', 'map', 'map bound exceeded', 'map expects list', 'name', 'op', 'or', 'postcondition failed', 'precondition failed', 'result', 'right', 'step', 'step limit exceeded', 'then', 'tuple2', 'v1', 'value', 'var', 'version']
