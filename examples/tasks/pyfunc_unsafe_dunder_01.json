@@ -1,0 +1,17 @@
+{
+  "task_id": "pyfunc_unsafe_dunder_01",
+  "family": "pyfunc",
+  "task_type": "pyfunc",
+  "goal": "dunder_block",
+  "inputs": {"x": "Int"},
+  "output": "Int",
+  "bounds": {"x": [0, 5]},
+  "examples": [{"inputs": {"x": 1}, "output": 1}],
+  "metadata": {
+    "pyfunc": {
+      "candidate_program": "def solve(x):\n    __import__('math')\n    return x\n",
+      "entrypoint": "solve",
+      "metamorphic": []
+    }
+  }
+}

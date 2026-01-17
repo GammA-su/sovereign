@@ -14,6 +14,11 @@ from ..bvps.interpreter import INTERPRETER_HASH, eval_program
 from ..config import Settings
 from ..forge.forge import ForgeGate
 from ..ledger.ledger import Ledger
+from ..pyfunc.program import (
+    PYEXEC_INTERPRETER_HASH,
+    PyFuncProgram,
+    compute_pyfunc_hash,
+)
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
 from ..utils import (
     canonical_dumps,
@@ -84,9 +89,31 @@ def _load_store_candidate(
             return program, program_hash
         if entry_domain == domain:
             domain_candidates.append((program, program_hash))
-    if domain_candidates:
-        domain_candidates.sort(key=lambda item: item[1])
-        return domain_candidates[0]
+        if domain_candidates:
+            domain_candidates.sort(key=lambda item: item[1])
+            return domain_candidates[0]
+    return None
+
+
+def _load_pyfunc_candidate(
+    store_dir: Path,
+    spec_signature: str,
+) -> tuple[PyFuncProgram, str] | None:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = read_json(manifest_path)
+    programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
+    for program_hash, entry in programs.items():
+        if entry.get("domain") != "pyfunc":
+            continue
+        if entry.get("spec_signature") != spec_signature:
+            continue
+        program_path = Path(entry.get("store_path", store_dir / "pyfunc" / f"{program_hash}.py"))
+        if not program_path.exists():
+            continue
+        code = program_path.read_text()
+        return PyFuncProgram(code), program_hash
     return None
 
 
@@ -152,40 +179,76 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             raise ContradictoryExamplesError("contradictory examples in task")
 
         spec_signature = task.spec_signature()
+        is_pyfunc = task.task_type == "pyfunc"
+        pyfunc_meta = task.metadata.get("pyfunc", {})
         warm_start_program: tuple[Program, str] | None = None
+        warm_start_from_store = False
+        pyfunc_candidate: tuple[PyFuncProgram, str] | None = None
         if settings.warm_start_store:
-            store_candidate = _load_store_candidate(
-                Path(settings.warm_start_store), spec_signature, task.task_type
-            )
-            if store_candidate:
-                warm_start_program = store_candidate
-                warm_start_candidate_hash = store_candidate[1]
+            if is_pyfunc:
+                pyfunc_candidate = _load_pyfunc_candidate(
+                    Path(settings.warm_start_store), spec_signature
+                )
+            if pyfunc_candidate:
+                warm_start_candidate_hash = pyfunc_candidate[1]
+                warm_start_from_store = True
+            else:
+                store_candidate = _load_store_candidate(
+                    Path(settings.warm_start_store), spec_signature, task.task_type
+                )
+                if store_candidate:
+                    warm_start_program = store_candidate
+                    warm_start_candidate_hash = store_candidate[1]
+                    warm_start_from_store = True
 
         rng_seed = settings.seed_for(run_dir.name)
-        if warm_start_program:
-            warm_start_attempted = True
-            program, program_hash = warm_start_program
-            tests = list(task.examples)
-            trace_hashes: List[str] = []
-            for example in tests:
-                _, trace_hash = eval_program(
-                    program, example.inputs, step_limit=settings.verify_budget_steps
-                )
-                trace_hashes.append(trace_hash)
+        tests = list(task.examples)
+        trace_hashes: List[str] = []
+        if is_pyfunc:
+            code_program: PyFuncProgram
+            code_hash: str
+            if pyfunc_candidate:
+                code_program, code_hash = pyfunc_candidate
+            else:
+                candidate_code = pyfunc_meta.get("candidate_program", "")
+                if not candidate_code:
+                    raise RuntimeError("missing pyfunc candidate program")
+                code_program = PyFuncProgram(candidate_code)
+                code_hash = compute_pyfunc_hash(candidate_code)
             cegis_result = CEGISResult(
                 status="ok",
-                program=program,
+                program=code_program,
                 tests=tests,
                 counterexamples=[],
-                ast_hash=program_hash,
-                interpreter_hash=INTERPRETER_HASH,
+                ast_hash=code_hash,
+                interpreter_hash=PYEXEC_INTERPRETER_HASH,
                 trace_hashes=trace_hashes,
             )
             synth_cost = 0
+            warm_start_attempted = warm_start_from_store
         else:
-            start_synth = time.time_ns()
-            cegis_result = run_cegis(task, settings, rng_seed)
-            synth_cost = time.time_ns() - start_synth
+            if warm_start_program:
+                warm_start_attempted = True
+                program, program_hash = warm_start_program
+                for example in tests:
+                    _, trace_hash = eval_program(
+                        program, example.inputs, step_limit=settings.verify_budget_steps
+                    )
+                    trace_hashes.append(trace_hash)
+                cegis_result = CEGISResult(
+                    status="ok",
+                    program=program,
+                    tests=tests,
+                    counterexamples=[],
+                    ast_hash=program_hash,
+                    interpreter_hash=INTERPRETER_HASH,
+                    trace_hashes=trace_hashes,
+                )
+                synth_cost = 0
+            else:
+                start_synth = time.time_ns()
+                cegis_result = run_cegis(task, settings, rng_seed)
+                synth_cost = time.time_ns() - start_synth
 
         artifacts.append(
             artifact_store.write_json(
@@ -206,6 +269,21 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 "bvps_traces",
             )
         )
+        if task.task_type == "pyfunc" and isinstance(cegis_result.program, PyFuncProgram):
+            artifacts.append(
+                artifact_store.write_bytes(
+                    "pyfunc/program.py",
+                    cegis_result.program.to_bytes(),
+                    "pyfunc_program",
+                )
+            )
+            artifacts.append(
+                artifact_store.write_json(
+                    "pyfunc/tests.json",
+                    [example.model_dump() for example in cegis_result.tests],
+                    "pyfunc_tests",
+                )
+            )
 
         if cegis_result.status != "ok" or cegis_result.program is None:
             failure_reason = cegis_result.failure_reason or "SYNTH_FAIL"
@@ -213,11 +291,12 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             if warm_start_attempted:
                 warm_start_candidate_rejected = True
         else:
-            artifacts.append(
-                artifact_store.write_json(
-                    "bvps/program.json", cegis_result.program.to_json(), "bvps_program"
+            if task.task_type != "pyfunc":
+                artifacts.append(
+                    artifact_store.write_json(
+                        "bvps/program.json", cegis_result.program.to_json(), "bvps_program"
+                    )
                 )
-            )
 
             spec = task_spec(task)
             verifier_ctx = VerifierContext(
@@ -263,9 +342,10 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             breaker_report = breaker_result.report
             breaker_kpi = breaker_result.kpi.model_dump()
 
-            required_pass = required_lanes_passed(
-                verdicts, settings.admission_policy.required_lanes
-            )
+            required_lanes = settings.admission_policy.required_lanes
+            if task.task_type == "pyfunc":
+                required_lanes = ["pyexec"]
+            required_pass = required_lanes_passed(verdicts, required_lanes)
             overall_verdict = "PASS" if required_pass else "FAIL"
             if not required_pass and not failure_reason:
                 failure_reason = "REQUIRED_LANES_FAIL"
@@ -327,8 +407,12 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             if decision.decision == "ADMIT":
                 store_dir = Path("store") / "v1" / task.task_type
                 ensure_dir(store_dir)
-                program_bytes = canonical_dumps(cegis_result.program.to_json())
-                store_path = store_dir / f"{cegis_result.ast_hash}.json"
+                ext = ".py" if task.task_type == "pyfunc" else ".json"
+                if task.task_type == "pyfunc" and isinstance(cegis_result.program, PyFuncProgram):
+                    program_bytes = cegis_result.program.to_bytes()
+                else:
+                    program_bytes = canonical_dumps(cegis_result.program.to_json())
+                store_path = store_dir / f"{cegis_result.ast_hash}{ext}"
                 store_path.write_bytes(program_bytes)
                 content_hash = hash_bytes(program_bytes)
                 ledger.append(

@@ -422,8 +422,11 @@ def store_audit_cmd(
             errors.append(f"missing:{program_hash}")
             continue
         data = entry_path.read_bytes()
-        if hash_bytes(data) != program_hash:
-            errors.append(f"hash_mismatch:{program_hash}")
+        computed = hash_bytes(data)
+        if computed != program_hash:
+            errors.append(
+                f"hash_mismatch:{program_hash}:computed={computed}"
+            )
         if entry.get("store_path"):
             if Path(entry["store_path"]).resolve() != entry_path.resolve():
                 errors.append(f"path_mismatch:{program_hash}")
@@ -542,33 +545,41 @@ def suite_run_cmd(
         if decision_data.get("decision") == "ADMIT" and program_hash:
             program_entry = programs.get(program_hash)
             manifest_spec = task.spec_signature()
-            store_path = store_dir / task.task_type / f"{program_hash}.json"
-            program_json: dict[str, Any] | None = None
-            run_program_path = actual_run / "artifacts" / "bvps" / "program.json"
+            ext = ".py" if task.task_type == "pyfunc" else ".json"
+            store_path = store_dir / task.task_type / f"{program_hash}{ext}"
+            program_bytes: bytes | None = None
+            artifact_base = actual_run / "artifacts"
+            if task.task_type == "pyfunc":
+                run_program_path = artifact_base / "pyfunc" / "program.py"
+            else:
+                run_program_path = artifact_base / "bvps" / "program.json"
             if run_program_path.exists():
-                program_json = read_json(run_program_path)
+                if task.task_type == "pyfunc":
+                    program_bytes = run_program_path.read_bytes()
+                else:
+                    program_bytes = canonical_dumps(read_json(run_program_path))
             elif settings.warm_start_store:
                 warm_manifest_path = Path(settings.warm_start_store) / "manifest.json"
                 if warm_manifest_path.exists():
                     warm_manifest = read_json(warm_manifest_path)
                     warm_programs = warm_manifest.get("programs", {})
                     warm_entry = warm_programs.get(program_hash, {})
+                    warm_domain = warm_entry.get("domain", task.task_type)
+                    warm_ext = ".py" if warm_domain == "pyfunc" else ".json"
+                    warm_fallback = (
+                        Path(settings.warm_start_store) / warm_domain / f"{program_hash}{warm_ext}"
+                    )
                     warm_source_path = Path(
-                        warm_entry.get(
-                            "store_path",
-                            Path(settings.warm_start_store)
-                            / warm_entry.get("domain", "")
-                            / f"{program_hash}.json",
-                        )
+                        warm_entry.get("store_path", warm_fallback)
                     )
                     if warm_source_path.exists():
-                        program_json = read_json(warm_source_path)
-            if program_json is None:
+                        program_bytes = warm_source_path.read_bytes()
+            if program_bytes is None:
                 raise RuntimeError(
                     f"cannot reproduce admitted program {program_hash} for task {task.task_id}"
                 )
             ensure_dir(store_path.parent)
-            store_path.write_bytes(canonical_dumps(program_json))
+            store_path.write_bytes(program_bytes)
             if not program_entry:
                 program_entry = {
                     "program_hash": program_hash,

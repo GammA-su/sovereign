@@ -26,7 +26,7 @@ from sovereidolon_v1.orchestrator.episode import episode_run
 from sovereidolon_v1.orchestrator.specs import task_spec
 from sovereidolon_v1.orchestrator.task import Example, Task
 from sovereidolon_v1.schemas import BGRevisionOp, VerifierVerdict
-from sovereidolon_v1.utils import read_json, stable_hash
+from sovereidolon_v1.utils import hash_bytes, read_json, stable_hash
 
 
 def test_ledger_chain_verification(tmp_path: Path) -> None:
@@ -465,6 +465,66 @@ def test_bool_task_fail_with_capsule(tmp_path: Path) -> None:
     assert list(capsule_dir.glob("failure_*.json"))
 
 
+def test_pyfunc_episode_pass(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "pyfunc_pass"
+    summary = episode_run(
+        task_file=Path("examples/tasks/pyfunc_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+    artifact_dir = Path(summary["ucr_path"]).parent / "artifacts"
+    program_path = artifact_dir / "pyfunc" / "program.py"
+    assert program_path.exists()
+
+
+def test_pyfunc_episode_fail(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "pyfunc_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/pyfunc_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    assert summary["failure_reason"] != ""
+
+
+def _pyexec_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "pyfunc" and entry.get("tier") == "pyexec":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("pyexec verdict missing")
+
+
+def test_pyfunc_adversarial_failure_atoms(tmp_path: Path) -> None:
+    settings = Settings()
+    tasks = [
+        ("pyfunc_unsafe_import_01.json", ["AST_FORBIDDEN_NODE"]),
+        ("pyfunc_unsafe_open_01.json", ["AST_FORBIDDEN_CALL"]),
+        ("pyfunc_unsafe_dunder_01.json", ["AST_FORBIDDEN_CALL"]),
+        ("pyfunc_timeout_01.json", ["TIMEOUT"]),
+        ("pyfunc_mem_01.json", ["RESOURCE_LIMIT"]),
+    ]
+    for task_file, expected_atoms in tasks:
+        run_dir = tmp_path / task_file
+        summary = episode_run(
+            task_file=Path(f"examples/tasks/{task_file}"),
+            run_dir=run_dir,
+            settings=settings,
+        )
+        assert summary["verdict"] == "FAIL", task_file
+        decision = read_json(run_dir / "forge" / "decision.json")
+        assert decision["decision"] != "ADMIT"
+        failure_atoms = _pyexec_failure_atoms(run_dir)
+        for atom in expected_atoms:
+            assert atom in failure_atoms
+
+
 def test_suite_run_reports(tmp_path: Path) -> None:
     suite_file = tmp_path / "suite.json"
     suite_payload = {
@@ -786,6 +846,163 @@ def test_suite_warm_start_store_persists(tmp_path: Path) -> None:
     assert warm_store_file.exists()
     manifest_entry = manifest_b["programs"][candidate_hash]
     assert Path(manifest_entry["store_path"]) == warm_store_file
+
+
+def test_suite_pyfunc_warm_start(tmp_path: Path) -> None:
+    runner = CliRunner()
+    suite_file = Path("examples/suites/suite_v2.json")
+    out_a = tmp_path / "suite_pyfunc_a"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    out_b = tmp_path / "suite_pyfunc_b"
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+    report_b = read_json(out_b / "report.json")
+    entry = next(task for task in report_b["per_task"] if task["task_id"] == "pyfunc_01")
+    assert entry["warm_start_store"]
+    assert entry["warm_start_provided"]
+    assert entry["synth_ns"] == 0
+    candidate_hash = entry["warm_start_candidate_hash"]
+    assert candidate_hash
+    warm_store_file = out_b / "store" / "pyfunc" / f"{candidate_hash}.py"
+    assert warm_store_file.exists()
+    manifest_b = read_json(out_b / "store" / "manifest.json")
+    manifest_entry = manifest_b.get("programs", {}).get(candidate_hash, {})
+    assert manifest_entry.get("store_path") == str(warm_store_file)
+
+
+def test_suite_v3_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_v3"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v3.json",
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report_norm = read_json(out_dir / "report.norm.json")
+    baseline = read_json(Path("examples/baselines/suite_v3.report.norm.json"))
+    assert report_norm == baseline
+    norm_text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_dir / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v2_store_audit_cold(tmp_path: Path) -> None:
+    runner = CliRunner()
+    suite_file = Path("examples/suites/suite_v2.json")
+    out_dir = tmp_path / "suite_v2_cold"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    store_dir = out_dir / "store"
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(store_dir)],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v2_store_audit_warm(tmp_path: Path) -> None:
+    runner = CliRunner()
+    suite_file = Path("examples/suites/suite_v2.json")
+    out_a = tmp_path / "suite_v2_cold"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    out_b = tmp_path / "suite_v2_warm"
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+
+    report_b = read_json(out_b / "report.json")
+    entry = next(task for task in report_b["per_task"] if task["task_id"] == "pyfunc_01")
+    assert entry["warm_start_store"]
+    assert entry["warm_start_provided"]
+    assert entry["warm_start_candidate_hash"]
+
+    program_hash = entry["program_hash"]
+    manifest = read_json(out_b / "store" / "manifest.json")
+    manifest_entry = manifest.get("programs", {}).get(program_hash)
+    assert manifest_entry
+    store_path = Path(manifest_entry["store_path"])
+    if not store_path.is_absolute():
+        store_path = out_b / "store" / store_path
+    assert store_path.exists()
+    assert hash_bytes(store_path.read_bytes()) == program_hash
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_b / "store")],
+    )
+    assert audit_result.exit_code == 0
+
 def test_forge_admit_and_reject(tmp_path: Path) -> None:
     store_root = Path("store") / "v1" / "arith"
     if store_root.exists():

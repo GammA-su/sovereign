@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from itertools import product
@@ -312,5 +317,92 @@ def transfer_lane(ctx: VerifierContext) -> VerifierVerdict:
         bounds=ctx.task.bounds,
         soundness_grade="HEURISTIC",
         metamorphic_families=["reverse", "duplicate"],
+        cost=cost,
+    )
+
+
+PYTHON_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _pyexec_env() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": "",
+        "PYTHONHOME": "",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+
+
+def pyexec_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    metamorphic_families: List[str] = []
+    program_path = Path(ctx.run_dir).resolve() / "artifacts" / "pyfunc" / "program.py"
+    verdict = "FAIL"
+    if not program_path.exists():
+        failure_atoms.append("EXCEPTION:MISSING_PROGRAM")
+    else:
+        payload = {
+            "tests": [example.model_dump() for example in ctx.tests],
+            "metamorphic": ctx.task.metadata.get("pyfunc", {}).get("metamorphic", []),
+        }
+        entrypoint = ctx.task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
+        script = (
+            "import importlib, sys; "
+            f"sys.path.insert(0, {str(PYTHON_ROOT)!r}); "
+            "import sovereidolon_v1.pyfunc.runner as runner; "
+            "runner.main()"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        script,
+                        "--program",
+                        str(program_path),
+                        "--entrypoint",
+                        entrypoint,
+                    ],
+                    input=json.dumps(payload),
+                    text=True,
+                    capture_output=True,
+                    timeout=1.0,
+                    env=_pyexec_env(),
+                    cwd=workdir,
+                )
+        except subprocess.TimeoutExpired:
+            failure_atoms.append("TIMEOUT")
+        else:
+            if proc.returncode != 0:
+                failure_atoms.append(
+                    "RESOURCE_LIMIT" if proc.returncode < 0 else "EXCEPTION:RUNNER_ERROR"
+                )
+            try:
+                result = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                failure_atoms.append("EXCEPTION:BAD_OUTPUT")
+            else:
+                verdict = result.get("verdict", "FAIL")
+                failure_atoms.extend(result.get("failure_atoms", []))
+                metamorphic_families = result.get("metamorphic_families", [])
+    if not failure_atoms and verdict == "PASS":
+        final_verdict: Literal["PASS", "FAIL"] = "PASS"
+    else:
+        final_verdict = "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": len(ctx.tests) + len(metamorphic_families)}
+    return VerifierVerdict(
+        verdict=final_verdict,
+        failure_atoms=failure_atoms,
+        domain="pyfunc",
+        tier="pyexec",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=metamorphic_families,
         cost=cost,
     )

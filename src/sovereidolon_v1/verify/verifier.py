@@ -7,6 +7,7 @@ from .lanes import (
     VerifierContext,
     anchor_lane,
     consequence_lane,
+    pyexec_lane,
     recompute_lane,
     transfer_lane,
     translation_lane,
@@ -14,7 +15,10 @@ from .lanes import (
 
 
 def run_verifiers(ctx: VerifierContext) -> List[VerifierVerdict]:
-    lanes = [recompute_lane, consequence_lane, translation_lane, anchor_lane, transfer_lane]
+    if ctx.task.task_type == "pyfunc":
+        lanes = [pyexec_lane]
+    else:
+        lanes = [recompute_lane, consequence_lane, translation_lane, anchor_lane, transfer_lane]
     return [lane(ctx) for lane in lanes]
 
 

@@ -1,0 +1,20 @@
+{
+  "task_id": "pyfunc_fail_01",
+  "family": "pyfunc",
+  "task_type": "pyfunc",
+  "goal": "sum",
+  "inputs": {"a": "Int", "b": "Int"},
+  "output": "Int",
+  "bounds": {"a": [0, 10], "b": [0, 10]},
+  "examples": [
+    {"inputs": {"a": 2, "b": 3}, "output": 5},
+    {"inputs": {"a": 5, "b": 7}, "output": 12}
+  ],
+  "metadata": {
+    "pyfunc": {
+      "candidate_program": "def solve(a, b):\n    return a - b\n",
+      "entrypoint": "solve",
+      "metamorphic": ["commutative"]
+    }
+  }
+}

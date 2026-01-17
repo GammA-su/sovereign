@@ -1,0 +1,17 @@
+{
+  "task_id": "pyfunc_timeout_01",
+  "family": "pyfunc",
+  "task_type": "pyfunc",
+  "goal": "timeout",
+  "inputs": {"x": "Int"},
+  "output": "Int",
+  "bounds": {"x": [0, 5]},
+  "examples": [{"inputs": {"x": 1}, "output": 1}],
+  "metadata": {
+    "pyfunc": {
+      "candidate_program": "def solve(x):\n    while True:\n        x = x\n    return x\n",
+      "entrypoint": "solve",
+      "metamorphic": []
+    }
+  }
+}

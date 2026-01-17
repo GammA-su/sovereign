@@ -1,0 +1,7 @@
+{
+  "suite_id": "suite_v2",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/pyfunc_fail_01.json"}
+  ]
+}
