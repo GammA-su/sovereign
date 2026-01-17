@@ -501,6 +501,16 @@ def _pyexec_failure_atoms(run_dir: Path) -> list[str]:
     raise AssertionError("pyexec verdict missing")
 
 
+def _pybreaker_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "pyfunc" and entry.get("tier") == "breaker":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("pyfunc breaker verdict missing")
+
+
 def test_pyfunc_adversarial_failure_atoms(tmp_path: Path) -> None:
     settings = Settings()
     tasks = [
@@ -518,11 +528,38 @@ def test_pyfunc_adversarial_failure_atoms(tmp_path: Path) -> None:
             settings=settings,
         )
         assert summary["verdict"] == "FAIL", task_file
-        decision = read_json(run_dir / "forge" / "decision.json")
-        assert decision["decision"] != "ADMIT"
+        decision_path = run_dir / "forge" / "decision.json"
+        if decision_path.exists():
+            decision = read_json(decision_path)
+            assert decision["decision"] != "ADMIT"
         failure_atoms = _pyexec_failure_atoms(run_dir)
         for atom in expected_atoms:
             assert atom in failure_atoms
+
+
+def test_pyfunc_breaker_trap_capsule(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "pyfunc_breaker_trap"
+    summary = episode_run(
+        task_file=Path("examples/tasks/pyfunc_breaker_trap_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+
+    breaker_atoms = _pybreaker_failure_atoms(run_dir)
+    assert "COUNTEREXAMPLE_FOUND" in breaker_atoms
+    assert "COUNTEREXAMPLE_FOUND:BREAKERV1" in breaker_atoms
+
+    capsule_dir = run_dir / "capsules"
+    capsule_path = next(capsule_dir.glob("failure_*.json"))
+    capsule = read_json(capsule_path)
+    assert "COUNTEREXAMPLE_FOUND" in capsule.get("failure_atoms", [])
+    counterexample = capsule.get("counterexample")
+    assert counterexample, "expected counterexample in capsule"
+    inputs = counterexample.get("inputs", {})
+    assert inputs.get("a") == 0
+    assert inputs.get("b") == 1
 
 
 def test_suite_run_reports(tmp_path: Path) -> None:
@@ -921,6 +958,90 @@ def test_suite_v3_baseline(tmp_path: Path) -> None:
         ["store", "audit", "--store", str(out_dir / "store")],
     )
     assert audit_result.exit_code == 0
+
+
+def test_suite_v4_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_v4"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v4.json",
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report_norm = read_json(out_dir / "report.norm.json")
+    baseline = read_json(Path("examples/baselines/suite_v4.report.norm.json"))
+    assert report_norm == baseline
+    norm_text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_dir / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v3_warm_regression(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_a = tmp_path / "suite_v3_warm_a"
+    out_b = tmp_path / "suite_v3_warm_b"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v3.json",
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v3.json",
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+
+    norm_path = out_b / "report.norm.json"
+    assert norm_path.exists()
+    norm_text = norm_path.read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+    report_norm = read_json(norm_path)
+    baseline = read_json(Path("examples/baselines/suite_v3_warm.report.norm.json"))
+    assert report_norm == baseline
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_b / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+    report = read_json(out_b / "report.json")
+    entry = next(task for task in report["per_task"] if task["task_id"] == "pyfunc_01")
+    assert entry["warm_start_provided"] is True
+    assert entry["warm_start_store"] is True
+    assert entry["synth_ns"] == 0
+    assert entry["warm_start_candidate_hash"]
+    assert entry["warm_start_candidate_hash"] == entry["program_hash"]
 
 
 def test_suite_v2_store_audit_cold(tmp_path: Path) -> None:

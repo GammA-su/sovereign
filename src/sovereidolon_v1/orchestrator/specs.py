@@ -41,6 +41,19 @@ class TaskSpec:
             if self.task.goal == "xor":
                 return (a_val and not b_val) or (not a_val and b_val)
             raise ValueError("unknown bool goal")
+        if self.task.task_type == "pyfunc":
+            int_values = [
+                int(value)
+                for name, value in inputs.items()
+                if self.task.inputs.get(name) == "Int"
+            ]
+            if self.task.goal == "sum":
+                return sum(int_values)
+            if self.task.goal == "max":
+                return max(int_values) if int_values else 0
+            if self.task.goal == "min":
+                return min(int_values) if int_values else 0
+            return sum(int_values)
         raise ValueError("unknown task type")
 
     def random_inputs(self, rng: random.Random) -> Dict[str, Any]:

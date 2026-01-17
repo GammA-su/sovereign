@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +11,7 @@ from ..orchestrator.specs import TaskSpec
 from ..orchestrator.task import Example, Task
 from ..schemas import BreakerKPI
 from ..utils import read_jsonl, write_jsonl_line
+from .pyfunc_breaker import BreakerBudget, BreakerResult, run_pyfunc_breaker
 
 
 def _fingerprint(inputs: Dict[str, Any]) -> List[str]:
@@ -93,14 +93,6 @@ def _minimize_failure(
     return inputs, steps
 
 
-@dataclass
-class BreakerResult:
-    counterexample: Optional[Example]
-    minimized: Optional[Example]
-    kpi: BreakerKPI
-    report: Dict[str, Any]
-
-
 class BreakerLab:
     def __init__(self, settings: Settings, run_dir: Path) -> None:
         self.settings = settings
@@ -123,6 +115,14 @@ class BreakerLab:
         budget: int,
         seed: int,
     ) -> BreakerResult:
+        if task.task_type == "pyfunc":
+            program_path = self.run_dir / "artifacts" / "pyfunc" / "program.py"
+            return run_pyfunc_breaker(
+                task,
+                program_path,
+                BreakerBudget(attempt_budget=budget),
+            )
+
         if task.task_type not in {"arith", "list"}:
             kpi = BreakerKPI(
                 CDR=0.0,

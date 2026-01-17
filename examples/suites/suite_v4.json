@@ -1,0 +1,13 @@
+{
+  "suite_id": "suite_v4",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/pyfunc_breaker_trap_01.json"},
+    {"task_file": "examples/tasks/pyfunc_fail_01.json"},
+    {"task_file": "examples/tasks/pyfunc_unsafe_import_01.json"},
+    {"task_file": "examples/tasks/pyfunc_unsafe_open_01.json"},
+    {"task_file": "examples/tasks/pyfunc_unsafe_dunder_01.json"},
+    {"task_file": "examples/tasks/pyfunc_timeout_01.json"},
+    {"task_file": "examples/tasks/pyfunc_mem_01.json"}
+  ]
+}

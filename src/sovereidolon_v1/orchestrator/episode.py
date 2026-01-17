@@ -130,6 +130,34 @@ def _synth_failure_verdict(task: Task, reason: str) -> VerifierVerdict:
     )
 
 
+def _pyfunc_breaker_verdict(
+    task: Task, breaker_report: Dict[str, Any]
+) -> VerifierVerdict:
+    counterexamples = breaker_report.get("counterexamples", [])
+    failure_atoms: List[str] = []
+    verdict: Literal["PASS", "FAIL"] = "PASS"
+    if counterexamples:
+        verdict = "FAIL"
+        failure_atoms = [
+            "COUNTEREXAMPLE_FOUND",
+            "COUNTEREXAMPLE_FOUND:BREAKERV1",
+        ]
+        extra_atoms = breaker_report.get("failure_atoms", [])
+        for atom in extra_atoms:
+            if atom not in failure_atoms:
+                failure_atoms.append(atom)
+    return VerifierVerdict(
+        verdict=verdict,
+        failure_atoms=failure_atoms,
+        domain="pyfunc",
+        tier="breaker",
+        bounds=task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=[],
+        cost={"attempts": int(breaker_report.get("attempts", 0))},
+    )
+
+
 def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str, Any]:
     run_dir = _select_run_dir(run_dir)
     _init_run_dirs(run_dir)
@@ -310,15 +338,9 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             )
 
             verdicts = run_verifiers(verifier_ctx)
-            verdicts_payload = [verdict.model_dump() for verdict in verdicts]
-            artifacts.append(
-                artifact_store.write_json(
-                    "reports/verifier.json", verdicts_payload, "verifier_report"
-                )
+            pyexec_pass = any(
+                verdict.tier == "pyexec" and verdict.verdict == "PASS" for verdict in verdicts
             )
-            for verdict in verdicts:
-                ledger.append("VERIFIER_RESULT", verdict.model_dump())
-
             breaker_lab = BreakerLab(settings, run_dir)
             breaker_result = breaker_lab.run(
                 task=task,
@@ -342,17 +364,35 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             breaker_report = breaker_result.report
             breaker_kpi = breaker_result.kpi.model_dump()
 
+            if task.task_type == "pyfunc" and pyexec_pass:
+                verdicts.append(_pyfunc_breaker_verdict(task, breaker_report))
+
+            verdicts_payload = [verdict.model_dump() for verdict in verdicts]
+            artifacts.append(
+                artifact_store.write_json(
+                    "reports/verifier.json", verdicts_payload, "verifier_report"
+                )
+            )
+            for verdict in verdicts:
+                ledger.append("VERIFIER_RESULT", verdict.model_dump())
+
             required_lanes = settings.admission_policy.required_lanes
             if task.task_type == "pyfunc":
-                required_lanes = ["pyexec"]
+                required_lanes = ["pyexec", "breaker"]
             required_pass = required_lanes_passed(verdicts, required_lanes)
             overall_verdict = "PASS" if required_pass else "FAIL"
             if not required_pass and not failure_reason:
                 failure_reason = "REQUIRED_LANES_FAIL"
 
             breaker_found = False
+            counterexamples = breaker_result.report.get("counterexamples", [])
+            if task.task_type == "pyfunc" and counterexamples:
+                breaker_found = True
+                failure_reason = "COUNTEREXAMPLE_FOUND"
             if task.sealed:
                 if breaker_result.report.get("counterexample") is not None:
+                    breaker_found = True
+                if breaker_result.report.get("counterexamples"):
                     breaker_found = True
                 if breaker_result.report.get("withheld_hits", 0) > 0:
                     breaker_found = True
@@ -530,11 +570,33 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     ledger.append("UCR_WRITTEN", {"path": str(ucr_path), "ucr_hash": ucr.stable_hash()})
 
     if overall_verdict == "FAIL":
+        failure_atoms: List[str] = []
+        for verdict in verdicts:
+            for atom in verdict.failure_atoms:
+                if atom not in failure_atoms:
+                    failure_atoms.append(atom)
+        required_lanes_summary = settings.admission_policy.required_lanes
+        if task and task.task_type == "pyfunc":
+            required_lanes_summary = ["pyexec", "breaker"]
+        verifier_summary = {
+            "overall_verdict": overall_verdict,
+            "required_lanes": required_lanes_summary,
+            "verdicts": [verdict.model_dump() for verdict in verdicts],
+        }
+        breaker_counterexample = None
+        if breaker_report.get("minimized") is not None:
+            breaker_counterexample = breaker_report.get("minimized")
+        elif breaker_report.get("counterexamples"):
+            breaker_counterexample = breaker_report.get("counterexamples")[0]
+        counterexample_hash = (
+            stable_hash(breaker_counterexample) if breaker_counterexample is not None else ""
+        )
         capsule = {
             "task_id": task_id,
             "run_id": run_dir.name,
             "witness_id": witness_id,
             "failure_reason": failure_reason,
+            "failure_atoms": failure_atoms,
             "stack_summary": stack_summary,
             "examples": [example.model_dump() for example in task.examples] if task else [],
             "counterexamples": [
@@ -542,6 +604,11 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             ]
             if cegis_result
             else [],
+            "counterexample": breaker_counterexample,
+            "counterexample_hash": counterexample_hash,
+            "breaker_kpi": breaker_kpi,
+            "verifier_summary": verifier_summary,
+            "program_hash": cegis_result.ast_hash if cegis_result else "",
             "trace_hashes": cegis_result.trace_hashes if cegis_result else [],
             "attempted_program": cegis_result.program.to_json()
             if cegis_result and cegis_result.program

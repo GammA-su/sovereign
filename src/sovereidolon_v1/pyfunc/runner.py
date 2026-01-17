@@ -53,7 +53,9 @@ def _run_function(
             "verdict": "FAIL",
             "failure_atoms": ["EXCEPTION:ENTRYPOINT_MISSING"],
             "metamorphic_families": [],
+            "outputs": [],
         }
+    outputs: list[Any] = []
     for example in tests:
         try:
             output = func(**example["inputs"])
@@ -62,18 +64,22 @@ def _run_function(
                 "verdict": "FAIL",
                 "failure_atoms": ["RESOURCE_LIMIT"],
                 "metamorphic_families": [],
+                "outputs": outputs,
             }
         except Exception as exc:  # noqa: BLE001
             return {
                 "verdict": "FAIL",
                 "failure_atoms": [f"EXCEPTION:{exc.__class__.__name__}"],
                 "metamorphic_families": [],
+                "outputs": outputs,
             }
+        outputs.append(output)
         if output != example["output"]:
             return {
                 "verdict": "FAIL",
                 "failure_atoms": ["EXCEPTION:TEST_MISMATCH"],
                 "metamorphic_families": [],
+                "outputs": outputs,
             }
     executed: list[str] = []
     for family in metamorphic:
@@ -126,6 +132,7 @@ def _run_function(
         "verdict": "PASS",
         "failure_atoms": [],
         "metamorphic_families": executed,
+        "outputs": outputs,
     }
 
 
