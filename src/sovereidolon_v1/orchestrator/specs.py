@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..bvps.interpreter import eval_program
+from ..jsonspec.program import JsonSpecProgram
+from ..jsonspec.runner import run_jsonspec_program
+from ..jsonspec.validator import JsonSpecValidationError, validate_jsonspec
 from ..orchestrator.task import Example, Task
 
 
@@ -56,6 +59,20 @@ class TaskSpec:
             return sum(int_values)
         if self.task.task_type == "codepatch":
             return True
+        if self.task.task_type == "jsonspec":
+            meta = self.task.metadata.get("jsonspec", {})
+            spec_program = meta.get("spec_program")
+            if spec_program is None:
+                raise ValueError("missing jsonspec spec_program")
+            program = getattr(self, "_jsonspec_program", None)
+            if program is None:
+                program = JsonSpecProgram(spec_program)
+                try:
+                    validate_jsonspec(program.spec)
+                except JsonSpecValidationError as exc:
+                    raise ValueError(exc.failure_atom) from exc
+                self._jsonspec_program = program
+            return run_jsonspec_program(program.spec, inputs)
         raise ValueError("unknown task type")
 
     def random_inputs(self, rng: random.Random) -> Dict[str, Any]:
@@ -82,6 +99,9 @@ class TaskSpec:
             return inputs
         if self.task.task_type == "codepatch":
             return {}
+        if self.task.task_type == "jsonspec":
+            key = next(iter(self.task.inputs.keys()), "input")
+            return {key: {}}
         raise ValueError("unknown task type")
 
     def generate_inputs(self, count: int, seed: int) -> Iterable[Dict[str, Any]]:

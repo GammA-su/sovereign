@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional
 from ..bvps.interpreter import eval_program
 from ..codepatch.breaker import run_codepatch_breaker
 from ..config import Settings
+from ..jsonspec.program import JsonSpecProgram
 from ..orchestrator.specs import TaskSpec
 from ..orchestrator.task import Example, Task
 from ..schemas import BreakerKPI
 from ..utils import read_jsonl, write_jsonl_line
+from .jsonspec_breaker import run_jsonspec_breaker
 from .pyfunc_breaker import BreakerBudget, BreakerResult, run_pyfunc_breaker
 
 
@@ -130,6 +132,31 @@ class BreakerLab:
                 BreakerBudget(attempt_budget=budget),
                 self.run_dir,
             )
+        if task.task_type == "jsonspec":
+            if not isinstance(program, JsonSpecProgram):
+                kpi = BreakerKPI(
+                    CDR=0.0,
+                    TMR=0.0,
+                    NOVN=0.0,
+                    WFHR=0.0,
+                    window={"attempts": 0},
+                    budget={"attempt_budget": budget},
+                )
+                report_data: Dict[str, Any] = {
+                    "counterexample": None,
+                    "minimized": None,
+                    "attempts": 0,
+                    "skipped": True,
+                }
+                return BreakerResult(
+                    counterexample=None, minimized=None, kpi=kpi, report=report_data
+                )
+            return run_jsonspec_breaker(
+                task,
+                program,
+                BreakerBudget(attempt_budget=budget),
+                self.run_dir,
+            )
 
         if task.task_type not in {"arith", "list"}:
             kpi = BreakerKPI(
@@ -140,13 +167,15 @@ class BreakerLab:
                 window={"attempts": 0},
                 budget={"attempt_budget": budget},
             )
-            report_data: Dict[str, Any] = {
+            report_payload: Dict[str, Any] = {
                 "counterexample": None,
                 "minimized": None,
                 "attempts": 0,
                 "skipped": True,
             }
-            return BreakerResult(counterexample=None, minimized=None, kpi=kpi, report=report_data)
+            return BreakerResult(
+                counterexample=None, minimized=None, kpi=kpi, report=report_payload
+            )
 
         rng = random.Random(seed)
         start = time.time_ns()

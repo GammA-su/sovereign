@@ -11,6 +11,7 @@ uv run pytest
 ./scripts/ci_golden_suite_v5.sh
 ./scripts/ci_golden_suite_v6.sh
 ./scripts/ci_golden_suite_v6_warm.sh
+./scripts/ci_golden_suite_v7.sh
 
 tracked_junk=$(git ls-files | rg -n "^(runs/|store/|.*__pycache__/)" || true)
 if [[ -n "${tracked_junk}" ]]; then

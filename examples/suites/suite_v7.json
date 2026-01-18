@@ -1,0 +1,16 @@
+{
+  "suite_id": "suite_v7",
+  "tasks": [
+    {"task_file": "examples/tasks/arith_01.json"},
+    {"task_file": "examples/tasks/arith_02.json"},
+    {"task_file": "examples/tasks/arith_fail_01.json"},
+    {"task_file": "examples/tasks/bool_01.json"},
+    {"task_file": "examples/tasks/bool_fail_01.json"},
+    {"task_file": "examples/tasks/arith_sealed_trap_01.json"},
+    {"task_file": "examples/tasks/jsonspec_pass_01.json"},
+    {"task_file": "examples/tasks/jsonspec_fail_01.json"},
+    {"task_file": "examples/tasks/jsonspec_sealed_trap_01.json"},
+    {"task_file": "examples/tasks/jsonspec_breaker_dups_01.json"},
+    {"task_file": "examples/tasks/jsonspec_meta_fail_01.json"}
+  ]
+}

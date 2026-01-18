@@ -18,6 +18,11 @@ from ..codepatch.program import (
 )
 from ..config import Settings
 from ..forge.forge import ForgeGate
+from ..jsonspec.program import (
+    JSONSPEC_INTERPRETER_HASH,
+    JsonSpecProgram,
+    compute_jsonspec_hash,
+)
 from ..ledger.ledger import Ledger
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
@@ -143,6 +148,31 @@ def _load_codepatch_candidate(
     return None
 
 
+def _load_jsonspec_candidate(
+    store_dir: Path,
+    spec_signature: str,
+) -> tuple[JsonSpecProgram, str] | None:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = read_json(manifest_path)
+    programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
+    for program_hash, entry in programs.items():
+        if entry.get("domain") != "jsonspec":
+            continue
+        if entry.get("spec_signature") != spec_signature:
+            continue
+        program_path = Path(
+            entry.get("store_path", store_dir / "jsonspec" / f"{program_hash}.json")
+        )
+        if not program_path.exists():
+            continue
+        program_data = read_json(program_path)
+        program = JsonSpecProgram(program_data)
+        return program, program_hash
+    return None
+
+
 def _synth_failure_verdict(task: Task, reason: str) -> VerifierVerdict:
     return VerifierVerdict(
         verdict="FAIL",
@@ -239,12 +269,15 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         spec_signature = task.spec_signature()
         is_pyfunc = task.task_type == "pyfunc"
         is_codepatch = task.task_type == "codepatch"
+        is_jsonspec = task.task_type == "jsonspec"
         pyfunc_meta = task.metadata.get("pyfunc", {})
         codepatch_meta = task.metadata.get("codepatch", {})
+        jsonspec_meta = task.metadata.get("jsonspec", {})
         warm_start_program: tuple[Program, str] | None = None
         warm_start_from_store = False
         pyfunc_candidate: tuple[PyFuncProgram, str] | None = None
         codepatch_candidate: tuple[CodePatchProgram, str] | None = None
+        jsonspec_candidate: tuple[JsonSpecProgram, str] | None = None
         if settings.warm_start_store:
             if is_pyfunc:
                 pyfunc_candidate = _load_pyfunc_candidate(
@@ -254,20 +287,28 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 codepatch_candidate = _load_codepatch_candidate(
                     Path(settings.warm_start_store), spec_signature
                 )
+            elif is_jsonspec:
+                jsonspec_candidate = _load_jsonspec_candidate(
+                    Path(settings.warm_start_store), spec_signature
+                )
             if pyfunc_candidate:
                 warm_start_candidate_hash = pyfunc_candidate[1]
                 warm_start_from_store = True
             elif codepatch_candidate:
                 warm_start_candidate_hash = codepatch_candidate[1]
                 warm_start_from_store = True
+            elif jsonspec_candidate:
+                warm_start_candidate_hash = jsonspec_candidate[1]
+                warm_start_from_store = True
             else:
-                store_candidate = _load_store_candidate(
-                    Path(settings.warm_start_store), spec_signature, task.task_type
-                )
-                if store_candidate:
-                    warm_start_program = store_candidate
-                    warm_start_candidate_hash = store_candidate[1]
-                    warm_start_from_store = True
+                if not is_jsonspec:
+                    store_candidate = _load_store_candidate(
+                        Path(settings.warm_start_store), spec_signature, task.task_type
+                    )
+                    if store_candidate:
+                        warm_start_program = store_candidate
+                        warm_start_candidate_hash = store_candidate[1]
+                        warm_start_from_store = True
 
         store_candidates: list[StoreCandidate] = []
         if pyfunc_candidate:
@@ -285,6 +326,15 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     program=codepatch_candidate[0],
                     program_hash=codepatch_candidate[1],
                     domain="codepatch",
+                    source="warm_start_store",
+                )
+            )
+        elif jsonspec_candidate:
+            store_candidates.append(
+                StoreCandidate(
+                    program=jsonspec_candidate[0],
+                    program_hash=jsonspec_candidate[1],
+                    domain="jsonspec",
                     source="warm_start_store",
                 )
             )
@@ -366,6 +416,29 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 trace_hashes=trace_hashes,
             )
             synth_cost = 0
+        elif is_jsonspec:
+            json_program: JsonSpecProgram
+            json_hash: str
+            candidate_program = proposer_output.candidate_program
+            if candidate_program is None or not isinstance(candidate_program, JsonSpecProgram):
+                candidate_spec = jsonspec_meta.get("candidate_program")
+                if not candidate_spec:
+                    raise RuntimeError("missing jsonspec candidate program")
+                candidate_program = JsonSpecProgram(candidate_spec)
+            json_program = candidate_program
+            json_hash = proposer_output.candidate_hash or compute_jsonspec_hash(
+                candidate_program.spec
+            )
+            cegis_result = CEGISResult(
+                status="ok",
+                program=json_program,
+                tests=tests,
+                counterexamples=[],
+                ast_hash=json_hash,
+                interpreter_hash=JSONSPEC_INTERPRETER_HASH,
+                trace_hashes=trace_hashes,
+            )
+            synth_cost = 0
         else:
             if proposer_output.candidate_program is not None:
                 warm_start_attempted = True
@@ -435,6 +508,16 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     "codepatch_program",
                 )
             )
+        if task.task_type == "jsonspec" and isinstance(
+            cegis_result.program, JsonSpecProgram
+        ):
+            artifacts.append(
+                artifact_store.write_bytes(
+                    "jsonspec/program.json",
+                    cegis_result.program.to_bytes(),
+                    "jsonspec_program",
+                )
+            )
 
         if cegis_result.status != "ok" or cegis_result.program is None:
             failure_reason = cegis_result.failure_reason or "SYNTH_FAIL"
@@ -442,7 +525,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             if warm_start_attempted:
                 warm_start_candidate_rejected = True
         else:
-            if task.task_type not in {"pyfunc", "codepatch"}:
+            if task.task_type not in {"pyfunc", "codepatch", "jsonspec"}:
                 artifacts.append(
                     artifact_store.write_json(
                         "bvps/program.json", cegis_result.program.to_json(), "bvps_program"
@@ -519,6 +602,8 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 required_lanes = ["pyexec", "breaker"]
             elif task.task_type == "codepatch":
                 required_lanes = ["codepatch", "metamorphic"]
+            elif task.task_type == "jsonspec":
+                required_lanes = ["jsonspec", "metamorphic"]
             required_pass = required_lanes_passed(verdicts, required_lanes)
             if task.task_type == "pyfunc":
                 meta_failed = any(
@@ -736,6 +821,8 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             required_lanes_summary = ["pyexec", "breaker"]
         if task and task.task_type == "codepatch":
             required_lanes_summary = ["codepatch", "metamorphic"]
+        if task and task.task_type == "jsonspec":
+            required_lanes_summary = ["jsonspec", "metamorphic"]
         verifier_summary = {
             "overall_verdict": overall_verdict,
             "required_lanes": required_lanes_summary,

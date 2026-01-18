@@ -491,6 +491,62 @@ def test_pyfunc_episode_fail(tmp_path: Path) -> None:
     assert summary["failure_reason"] != ""
 
 
+def test_jsonspec_episode_pass(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "jsonspec_pass"
+    summary = episode_run(
+        task_file=Path("examples/tasks/jsonspec_pass_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+    artifact_dir = Path(summary["ucr_path"]).parent / "artifacts"
+    program_path = artifact_dir / "jsonspec" / "program.json"
+    assert program_path.exists()
+
+
+def test_jsonspec_episode_fail(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "jsonspec_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/jsonspec_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    failure_atoms = _jsonspec_failure_atoms(run_dir)
+    assert "JSONSPEC_OUTPUT_MISMATCH" in failure_atoms
+
+
+def test_jsonspec_metamorphic_failure_atoms(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "jsonspec_meta_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/jsonspec_meta_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    failure_atoms = _jsonspec_meta_failure_atoms(run_dir)
+    assert "METAMORPHIC_VIOLATION:key_order_invariance" in failure_atoms
+
+
+def test_jsonspec_breaker_duplicate_budget_terminates(tmp_path: Path) -> None:
+    settings = Settings(break_budget_attempts=5)
+    run_dir = tmp_path / "jsonspec_breaker_dups"
+    summary = episode_run(
+        task_file=Path("examples/tasks/jsonspec_breaker_dups_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+    breaker_kpi_path = run_dir / "artifacts" / "reports" / "breaker_kpi.json"
+    assert breaker_kpi_path.exists()
+    breaker_kpi = read_json(breaker_kpi_path)
+    assert breaker_kpi.get("window", {}).get("attempts") == settings.break_budget_attempts
+    assert breaker_kpi.get("budget", {}).get("attempt_budget") == settings.break_budget_attempts
+
+
 def _pyexec_failure_atoms(run_dir: Path) -> list[str]:
     report_path = run_dir / "artifacts" / "reports" / "verifier.json"
     assert report_path.exists(), "verifier report missing"
@@ -519,6 +575,26 @@ def _codepatch_meta_failure_atoms(run_dir: Path) -> list[str]:
         if entry.get("domain") == "codepatch" and entry.get("tier") == "metamorphic":
             return entry.get("failure_atoms", [])
     raise AssertionError("codepatch metamorphic verdict missing")
+
+
+def _jsonspec_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "jsonspec" and entry.get("tier") == "jsonspec":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("jsonspec verdict missing")
+
+
+def _jsonspec_meta_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "jsonspec" and entry.get("tier") == "metamorphic":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("jsonspec metamorphic verdict missing")
 
 
 def _pymeta_failure_atoms(run_dir: Path) -> list[str]:
@@ -1090,6 +1166,57 @@ def test_suite_pyfunc_warm_start(tmp_path: Path) -> None:
     assert manifest_entry.get("store_path") == str(warm_store_file)
 
 
+def test_jsonspec_warm_start(tmp_path: Path) -> None:
+    runner = CliRunner()
+    suite_file = tmp_path / "jsonspec_warm_suite.json"
+    suite_payload = {
+        "suite_id": "jsonspec_warm_suite",
+        "tasks": [{"task_file": "examples/tasks/jsonspec_pass_01.json"}],
+    }
+    suite_file.write_text(orjson.dumps(suite_payload).decode("utf-8"), encoding="utf-8")
+
+    out_a = tmp_path / "jsonspec_warm_a"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    out_b = tmp_path / "jsonspec_warm_b"
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            str(suite_file),
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+    report_b = read_json(out_b / "report.json")
+    entry = next(
+        task for task in report_b["per_task"] if task["task_id"] == "jsonspec_pass_01"
+    )
+    assert entry["warm_start_store"]
+    assert entry["warm_start_provided"]
+    assert entry["synth_ns"] == 0
+    assert entry["warm_start_candidate_hash"] == entry["program_hash"]
+    candidate_hash = entry["warm_start_candidate_hash"]
+    warm_store_file = out_b / "store" / "jsonspec" / f"{candidate_hash}.json"
+    assert warm_store_file.exists()
+
+
 def test_suite_v3_baseline(tmp_path: Path) -> None:
     runner = CliRunner()
     out_dir = tmp_path / "suite_v3"
@@ -1209,6 +1336,34 @@ def test_suite_v6_baseline(tmp_path: Path) -> None:
     )
     assert audit_result.exit_code == 0
 
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_dir / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v7_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_v7"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v7.json",
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report_norm = read_json(out_dir / "report.norm.json")
+    baseline = read_json(Path("examples/baselines/suite_v7.report.norm.json"))
+    assert report_norm == baseline
+    norm_text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
     audit_result = runner.invoke(
         app,
         ["store", "audit", "--store", str(out_dir / "store")],

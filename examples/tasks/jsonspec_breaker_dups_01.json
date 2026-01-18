@@ -1,0 +1,33 @@
+{
+  "task_id": "jsonspec_breaker_dups_01",
+  "family": "jsonspec",
+  "task_type": "jsonspec",
+  "goal": "transform",
+  "inputs": {"input": "Json"},
+  "output": "Json",
+  "bounds": {},
+  "examples": [
+    {
+      "inputs": {"input": {"flag": true}},
+      "output": {"flag": true}
+    }
+  ],
+  "metadata": {
+    "jsonspec": {
+      "candidate_program": {
+        "op": "object",
+        "items": {
+          "flag": {"op": "get", "path": ["flag"]}
+        }
+      },
+      "spec_program": {
+        "op": "object",
+        "items": {
+          "flag": {"op": "get", "path": ["flag"]}
+        }
+      },
+      "metamorphic": [],
+      "breaker": {"pool_size": 1, "max_items": 1, "keys": ["flag"], "values": [true]}
+    }
+  }
+}

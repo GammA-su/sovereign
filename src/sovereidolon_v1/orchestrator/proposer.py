@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ..codepatch.program import CodePatchProgram, compute_codepatch_hash
+from ..jsonspec.program import JsonSpecProgram, compute_jsonspec_hash
 from ..pyfunc.program import PyFuncProgram, compute_pyfunc_hash
 from .task import Task
 
@@ -85,6 +86,18 @@ class ProposerStub:
                 return ProposerOutput(
                     candidate_program=patch_program,
                     candidate_hash=compute_codepatch_hash(patch_program.patch),
+                    rationale="task_metadata",
+                    predicted_lane_costs=predicted_lane_costs,
+                    risk_flags=[],
+                    source="metadata",
+                )
+        if task.task_type == "jsonspec":
+            candidate_spec = task.metadata.get("jsonspec", {}).get("candidate_program")
+            if candidate_spec:
+                json_program = JsonSpecProgram(candidate_spec)
+                return ProposerOutput(
+                    candidate_program=json_program,
+                    candidate_hash=compute_jsonspec_hash(json_program.spec),
                     rationale="task_metadata",
                     predicted_lane_costs=predicted_lane_costs,
                     risk_flags=[],

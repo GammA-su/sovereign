@@ -1,0 +1,34 @@
+{
+  "task_id": "jsonspec_fail_01",
+  "family": "jsonspec",
+  "task_type": "jsonspec",
+  "goal": "transform",
+  "inputs": {"input": "Json"},
+  "output": "Json",
+  "bounds": {},
+  "examples": [
+    {
+      "inputs": {"input": {"user": {"name": "Ada", "age": 35}, "active": true}},
+      "output": {"name": "Ada", "active": true}
+    }
+  ],
+  "metadata": {
+    "jsonspec": {
+      "candidate_program": {
+        "op": "object",
+        "items": {
+          "name": {"op": "get", "path": ["user", "age"]},
+          "active": {"op": "get", "path": ["active"]}
+        }
+      },
+      "spec_program": {
+        "op": "object",
+        "items": {
+          "name": {"op": "get", "path": ["user", "name"]},
+          "active": {"op": "get", "path": ["active"]}
+        }
+      },
+      "metamorphic": ["key_order_invariance", "whitespace_invariance"]
+    }
+  }
+}

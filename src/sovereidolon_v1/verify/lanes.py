@@ -24,6 +24,9 @@ from ..codepatch.applier import apply_patch, parse_unified_diff
 from ..codepatch.runner import default_test_command, run_codepatch, run_tests_in_dir
 from ..codepatch.validator import extract_patch_paths, validate_patch
 from ..config import Settings
+from ..jsonspec.program import JsonSpecProgram
+from ..jsonspec.runner import JsonSpecRuntimeError, run_jsonspec_program
+from ..jsonspec.validator import JsonSpecValidationError, validate_jsonspec
 from ..ledger.ledger import Ledger
 from ..orchestrator.specs import TaskSpec
 from ..orchestrator.task import Example, Task
@@ -494,6 +497,178 @@ def pyexec_metamorphic_lane(ctx: VerifierContext) -> VerifierVerdict:
         verdict=final_verdict,
         failure_atoms=failure_atoms,
         domain="pyfunc",
+        tier="metamorphic",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=metamorphic_families,
+        cost=cost,
+    )
+
+
+def jsonspec_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    tests_run = 0
+    program = ctx.program if isinstance(ctx.program, JsonSpecProgram) else None
+    if program is None:
+        candidate = ctx.task.metadata.get("jsonspec", {}).get("candidate_program")
+        if candidate:
+            program = JsonSpecProgram(candidate)
+    if program is None:
+        failure_atoms.append("JSONSPEC_MISSING_PROGRAM")
+    else:
+        try:
+            validate_jsonspec(program.spec)
+            for example in ctx.tests:
+                try:
+                    actual = run_jsonspec_program(program.spec, example.inputs)
+                except JsonSpecRuntimeError as exc:
+                    failure_atoms.append(exc.failure_atom)
+                    break
+                tests_run += 1
+                if actual != example.output:
+                    failure_atoms.append("JSONSPEC_OUTPUT_MISMATCH")
+                    break
+        except JsonSpecValidationError as exc:
+            failure_atoms.append(exc.failure_atom)
+    verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": tests_run}
+    return VerifierVerdict(
+        verdict=verdict,
+        failure_atoms=failure_atoms,
+        domain="jsonspec",
+        tier="jsonspec",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=[],
+        cost=cost,
+    )
+
+
+def _jsonspec_permute(value: Any) -> Any:
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        if len(keys) < 2:
+            return value
+        permuted = list(reversed(keys))
+        return {key: _jsonspec_permute(value[key]) for key in permuted}
+    if isinstance(value, list):
+        return [_jsonspec_permute(item) for item in value]
+    return value
+
+
+def _jsonspec_json_string(value: Any) -> str:
+    return json.dumps(value, indent=2)
+
+
+def _jsonspec_derive_input(inputs: Dict[str, Any], family: str) -> Dict[str, Any] | None:
+    if len(inputs) != 1:
+        return None
+    key = next(iter(inputs))
+    raw = inputs[key]
+    try:
+        if isinstance(raw, str):
+            parsed = json.loads(raw)
+        else:
+            parsed = raw
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if family == "key_order_invariance":
+        original_keys = list(parsed.keys())
+        derived = _jsonspec_permute(parsed)
+        if not isinstance(derived, dict):
+            return None
+        if list(derived.keys()) == original_keys:
+            return None
+        return {key: derived}
+    if family == "whitespace_invariance":
+        return {key: _jsonspec_json_string(parsed)}
+    return None
+
+
+def jsonspec_metamorphic_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    metamorphic_families: List[str] = []
+    tests_run = 0
+    program = ctx.program if isinstance(ctx.program, JsonSpecProgram) else None
+    if program is None:
+        candidate = ctx.task.metadata.get("jsonspec", {}).get("candidate_program")
+        if candidate:
+            program = JsonSpecProgram(candidate)
+    if program is None:
+        cost = {"ns": time.time_ns() - start, "tests": tests_run}
+        return VerifierVerdict(
+            verdict="PASS",
+            failure_atoms=[],
+            domain="jsonspec",
+            tier="metamorphic",
+            bounds=ctx.task.bounds,
+            soundness_grade="BOUNDED",
+            metamorphic_families=[],
+            cost=cost,
+        )
+
+    meta = ctx.task.metadata.get("jsonspec", {})
+    configured = meta.get("metamorphic", [])
+    selected = [
+        name for name in configured if name in {"key_order_invariance", "whitespace_invariance"}
+    ]
+    if not selected:
+        cost = {"ns": time.time_ns() - start, "tests": tests_run}
+        return VerifierVerdict(
+            verdict="PASS",
+            failure_atoms=[],
+            domain="jsonspec",
+            tier="metamorphic",
+            bounds=ctx.task.bounds,
+            soundness_grade="BOUNDED",
+            metamorphic_families=[],
+            cost=cost,
+        )
+    try:
+        validate_jsonspec(program.spec)
+    except JsonSpecValidationError:
+        cost = {"ns": time.time_ns() - start, "tests": tests_run}
+        return VerifierVerdict(
+            verdict="PASS",
+            failure_atoms=[],
+            domain="jsonspec",
+            tier="metamorphic",
+            bounds=ctx.task.bounds,
+            soundness_grade="BOUNDED",
+            metamorphic_families=[],
+            cost=cost,
+        )
+
+    for family in selected:
+        family_failed = False
+        for example in ctx.tests:
+            derived = _jsonspec_derive_input(example.inputs, family)
+            if derived is None:
+                continue
+            try:
+                base_output = run_jsonspec_program(program.spec, example.inputs)
+                derived_output = run_jsonspec_program(program.spec, derived)
+            except JsonSpecRuntimeError:
+                family_failed = True
+                break
+            tests_run += 1
+            if derived_output != base_output:
+                family_failed = True
+                break
+        if family_failed:
+            failure_atoms.append(f"METAMORPHIC_VIOLATION:{family}")
+        metamorphic_families.append(family)
+
+    final_verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": tests_run}
+    return VerifierVerdict(
+        verdict=final_verdict,
+        failure_atoms=failure_atoms,
+        domain="jsonspec",
         tier="metamorphic",
         bounds=ctx.task.bounds,
         soundness_grade="BOUNDED",

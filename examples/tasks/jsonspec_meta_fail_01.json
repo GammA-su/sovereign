@@ -1,0 +1,28 @@
+{
+  "task_id": "jsonspec_meta_fail_01",
+  "family": "jsonspec",
+  "task_type": "jsonspec",
+  "goal": "keys",
+  "inputs": {"input": "Json"},
+  "output": "Json",
+  "bounds": {},
+  "examples": [
+    {
+      "inputs": {"input": {"b": 2, "a": 1}},
+      "output": {"keys": ["b", "a"]}
+    }
+  ],
+  "metadata": {
+    "jsonspec": {
+      "candidate_program": {
+        "op": "object",
+        "items": {"keys": {"op": "keys", "path": []}}
+      },
+      "spec_program": {
+        "op": "object",
+        "items": {"keys": {"op": "keys", "path": []}}
+      },
+      "metamorphic": ["key_order_invariance", "whitespace_invariance"]
+    }
+  }
+}

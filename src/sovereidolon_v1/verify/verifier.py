@@ -9,6 +9,8 @@ from .lanes import (
     codepatch_lane,
     codepatch_metamorphic_lane,
     consequence_lane,
+    jsonspec_lane,
+    jsonspec_metamorphic_lane,
     pyexec_lane,
     pyexec_metamorphic_lane,
     recompute_lane,
@@ -22,6 +24,8 @@ def run_verifiers(ctx: VerifierContext) -> List[VerifierVerdict]:
         lanes = [pyexec_lane, pyexec_metamorphic_lane]
     elif ctx.task.task_type == "codepatch":
         lanes = [codepatch_lane, codepatch_metamorphic_lane]
+    elif ctx.task.task_type == "jsonspec":
+        lanes = [jsonspec_lane, jsonspec_metamorphic_lane]
     else:
         lanes = [recompute_lane, consequence_lane, translation_lane, anchor_lane, transfer_lane]
     return [lane(ctx) for lane in lanes]

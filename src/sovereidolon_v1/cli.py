@@ -588,6 +588,8 @@ def suite_run_cmd(
                 run_program_path = artifact_base / "pyfunc" / "program.py"
             elif task.task_type == "codepatch":
                 run_program_path = artifact_base / "codepatch" / "program.patch"
+            elif task.task_type == "jsonspec":
+                run_program_path = artifact_base / "jsonspec" / "program.json"
             else:
                 run_program_path = artifact_base / "bvps" / "program.json"
             if run_program_path.exists():
