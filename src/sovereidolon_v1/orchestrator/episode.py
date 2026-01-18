@@ -11,14 +11,15 @@ from ..breaker.breaker import BreakerLab
 from ..bvps.cegis import CEGISResult, run_cegis
 from ..bvps.dsl import Program
 from ..bvps.interpreter import INTERPRETER_HASH, eval_program
+from ..codepatch.program import (
+    CODEPATCH_INTERPRETER_HASH,
+    CodePatchProgram,
+    compute_codepatch_hash,
+)
 from ..config import Settings
 from ..forge.forge import ForgeGate
 from ..ledger.ledger import Ledger
-from ..pyfunc.program import (
-    PYEXEC_INTERPRETER_HASH,
-    PyFuncProgram,
-    compute_pyfunc_hash,
-)
+from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
 from ..utils import (
     canonical_dumps,
@@ -32,6 +33,7 @@ from ..utils import (
 from ..verify.lanes import VerifierContext
 from ..verify.verifier import required_lanes_passed, run_verifiers
 from .kernel import KernelStub
+from .proposer import ProposerBudget, ProposerInput, ProposerStub, StoreCandidate
 from .specs import task_spec
 from .task import Task, load_task
 
@@ -117,6 +119,30 @@ def _load_pyfunc_candidate(
     return None
 
 
+def _load_codepatch_candidate(
+    store_dir: Path,
+    spec_signature: str,
+) -> tuple[CodePatchProgram, str] | None:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = read_json(manifest_path)
+    programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
+    for program_hash, entry in programs.items():
+        if entry.get("domain") != "codepatch":
+            continue
+        if entry.get("spec_signature") != spec_signature:
+            continue
+        program_path = Path(
+            entry.get("store_path", store_dir / "codepatch" / f"{program_hash}.patch")
+        )
+        if not program_path.exists():
+            continue
+        patch_text = program_path.read_text(encoding="utf-8")
+        return CodePatchProgram(patch_text), program_hash
+    return None
+
+
 def _synth_failure_verdict(task: Task, reason: str) -> VerifierVerdict:
     return VerifierVerdict(
         verdict="FAIL",
@@ -184,6 +210,10 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     witness_id = ""
     active_view_hash = ""
     synth_cost = 0
+    verify_cost = 0
+    breaker_cost = 0
+    breaker_attempts = 0
+    meta_cases = 0
     cegis_result: Optional[CEGISResult] = None
     warm_start = False
     warm_start_candidate_hash = ""
@@ -208,17 +238,27 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
 
         spec_signature = task.spec_signature()
         is_pyfunc = task.task_type == "pyfunc"
+        is_codepatch = task.task_type == "codepatch"
         pyfunc_meta = task.metadata.get("pyfunc", {})
+        codepatch_meta = task.metadata.get("codepatch", {})
         warm_start_program: tuple[Program, str] | None = None
         warm_start_from_store = False
         pyfunc_candidate: tuple[PyFuncProgram, str] | None = None
+        codepatch_candidate: tuple[CodePatchProgram, str] | None = None
         if settings.warm_start_store:
             if is_pyfunc:
                 pyfunc_candidate = _load_pyfunc_candidate(
                     Path(settings.warm_start_store), spec_signature
                 )
+            elif is_codepatch:
+                codepatch_candidate = _load_codepatch_candidate(
+                    Path(settings.warm_start_store), spec_signature
+                )
             if pyfunc_candidate:
                 warm_start_candidate_hash = pyfunc_candidate[1]
+                warm_start_from_store = True
+            elif codepatch_candidate:
+                warm_start_candidate_hash = codepatch_candidate[1]
                 warm_start_from_store = True
             else:
                 store_candidate = _load_store_candidate(
@@ -229,20 +269,70 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     warm_start_candidate_hash = store_candidate[1]
                     warm_start_from_store = True
 
+        store_candidates: list[StoreCandidate] = []
+        if pyfunc_candidate:
+            store_candidates.append(
+                StoreCandidate(
+                    program=pyfunc_candidate[0],
+                    program_hash=pyfunc_candidate[1],
+                    domain="pyfunc",
+                    source="warm_start_store",
+                )
+            )
+        elif codepatch_candidate:
+            store_candidates.append(
+                StoreCandidate(
+                    program=codepatch_candidate[0],
+                    program_hash=codepatch_candidate[1],
+                    domain="codepatch",
+                    source="warm_start_store",
+                )
+            )
+        elif warm_start_program:
+            store_candidates.append(
+                StoreCandidate(
+                    program=warm_start_program[0],
+                    program_hash=warm_start_program[1],
+                    domain=task.task_type,
+                    source="warm_start_store",
+                )
+            )
+
+        proposer = ProposerStub()
+        proposer_input = ProposerInput(
+            task=task,
+            spec_signature=spec_signature,
+            store_candidates=store_candidates,
+            budget=ProposerBudget(
+                break_budget_attempts=settings.break_budget_attempts,
+                verify_budget_steps=settings.verify_budget_steps,
+            ),
+        )
+        proposer_output = proposer.propose(proposer_input)
+        artifacts.append(
+            artifact_store.write_json(
+                "reports/proposer.json", proposer_output.report(), "proposer_report"
+            )
+        )
+        ledger.append("PROPOSER_RESULT", proposer_output.report())
+
         rng_seed = settings.seed_for(run_dir.name)
         tests = list(task.examples)
         trace_hashes: List[str] = []
+        warm_start_attempted = warm_start_from_store
         if is_pyfunc:
             code_program: PyFuncProgram
             code_hash: str
-            if pyfunc_candidate:
-                code_program, code_hash = pyfunc_candidate
-            else:
+            candidate_program = proposer_output.candidate_program
+            if candidate_program is None or not isinstance(candidate_program, PyFuncProgram):
                 candidate_code = pyfunc_meta.get("candidate_program", "")
                 if not candidate_code:
                     raise RuntimeError("missing pyfunc candidate program")
-                code_program = PyFuncProgram(candidate_code)
-                code_hash = compute_pyfunc_hash(candidate_code)
+                candidate_program = PyFuncProgram(candidate_code)
+            code_program = candidate_program
+            code_hash = proposer_output.candidate_hash or compute_pyfunc_hash(
+                candidate_program.code
+            )
             cegis_result = CEGISResult(
                 status="ok",
                 program=code_program,
@@ -253,11 +343,34 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 trace_hashes=trace_hashes,
             )
             synth_cost = 0
-            warm_start_attempted = warm_start_from_store
+        elif is_codepatch:
+            patch_program: CodePatchProgram
+            patch_hash: str
+            candidate_program = proposer_output.candidate_program
+            if candidate_program is None or not isinstance(candidate_program, CodePatchProgram):
+                candidate_patch = codepatch_meta.get("candidate_patch", "")
+                if not candidate_patch:
+                    raise RuntimeError("missing codepatch candidate patch")
+                candidate_program = CodePatchProgram(candidate_patch)
+            patch_program = candidate_program
+            patch_hash = proposer_output.candidate_hash or compute_codepatch_hash(
+                candidate_program.patch
+            )
+            cegis_result = CEGISResult(
+                status="ok",
+                program=patch_program,
+                tests=tests,
+                counterexamples=[],
+                ast_hash=patch_hash,
+                interpreter_hash=CODEPATCH_INTERPRETER_HASH,
+                trace_hashes=trace_hashes,
+            )
+            synth_cost = 0
         else:
-            if warm_start_program:
+            if proposer_output.candidate_program is not None:
                 warm_start_attempted = True
-                program, program_hash = warm_start_program
+                program = proposer_output.candidate_program
+                program_hash = proposer_output.candidate_hash
                 for example in tests:
                     _, trace_hash = eval_program(
                         program, example.inputs, step_limit=settings.verify_budget_steps
@@ -312,6 +425,16 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     "pyfunc_tests",
                 )
             )
+        if task.task_type == "codepatch" and isinstance(
+            cegis_result.program, CodePatchProgram
+        ):
+            artifacts.append(
+                artifact_store.write_bytes(
+                    "codepatch/program.patch",
+                    cegis_result.program.to_bytes(),
+                    "codepatch_program",
+                )
+            )
 
         if cegis_result.status != "ok" or cegis_result.program is None:
             failure_reason = cegis_result.failure_reason or "SYNTH_FAIL"
@@ -319,7 +442,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             if warm_start_attempted:
                 warm_start_candidate_rejected = True
         else:
-            if task.task_type != "pyfunc":
+            if task.task_type not in {"pyfunc", "codepatch"}:
                 artifacts.append(
                     artifact_store.write_json(
                         "bvps/program.json", cegis_result.program.to_json(), "bvps_program"
@@ -338,10 +461,19 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             )
 
             verdicts = run_verifiers(verifier_ctx)
+            verify_cost = sum(
+                int(verdict.cost.get("ns", 0)) for verdict in verdicts if verdict.cost
+            )
+            meta_cases = sum(
+                int(verdict.cost.get("tests", 0))
+                for verdict in verdicts
+                if verdict.tier == "metamorphic" and verdict.cost
+            )
             pyexec_pass = any(
                 verdict.tier == "pyexec" and verdict.verdict == "PASS" for verdict in verdicts
             )
             breaker_lab = BreakerLab(settings, run_dir)
+            breaker_start = time.time_ns()
             breaker_result = breaker_lab.run(
                 task=task,
                 program=cegis_result.program,
@@ -349,6 +481,12 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 tests=cegis_result.tests,
                 budget=settings.break_budget_attempts,
                 seed=rng_seed + 99,
+            )
+            breaker_cost = time.time_ns() - breaker_start
+            breaker_attempts = int(
+                breaker_result.kpi.window.get(
+                    "attempts", breaker_result.report.get("attempts", 0)
+                )
             )
             artifacts.append(
                 artifact_store.write_json(
@@ -379,7 +517,16 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             required_lanes = settings.admission_policy.required_lanes
             if task.task_type == "pyfunc":
                 required_lanes = ["pyexec", "breaker"]
+            elif task.task_type == "codepatch":
+                required_lanes = ["codepatch", "metamorphic"]
             required_pass = required_lanes_passed(verdicts, required_lanes)
+            if task.task_type == "pyfunc":
+                meta_failed = any(
+                    verdict.tier == "metamorphic" and verdict.verdict == "FAIL"
+                    for verdict in verdicts
+                )
+                if meta_failed:
+                    required_pass = False
             overall_verdict = "PASS" if required_pass else "FAIL"
             if not required_pass and not failure_reason:
                 failure_reason = "REQUIRED_LANES_FAIL"
@@ -447,8 +594,17 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             if decision.decision == "ADMIT":
                 store_dir = Path("store") / "v1" / task.task_type
                 ensure_dir(store_dir)
-                ext = ".py" if task.task_type == "pyfunc" else ".json"
+                if task.task_type == "pyfunc":
+                    ext = ".py"
+                elif task.task_type == "codepatch":
+                    ext = ".patch"
+                else:
+                    ext = ".json"
                 if task.task_type == "pyfunc" and isinstance(cegis_result.program, PyFuncProgram):
+                    program_bytes = cegis_result.program.to_bytes()
+                elif task.task_type == "codepatch" and isinstance(
+                    cegis_result.program, CodePatchProgram
+                ):
                     program_bytes = cegis_result.program.to_bytes()
                 else:
                     program_bytes = canonical_dumps(cegis_result.program.to_json())
@@ -578,6 +734,8 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         required_lanes_summary = settings.admission_policy.required_lanes
         if task and task.task_type == "pyfunc":
             required_lanes_summary = ["pyexec", "breaker"]
+        if task and task.task_type == "codepatch":
+            required_lanes_summary = ["codepatch", "metamorphic"]
         verifier_summary = {
             "overall_verdict": overall_verdict,
             "required_lanes": required_lanes_summary,
@@ -586,8 +744,10 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         breaker_counterexample = None
         if breaker_report.get("minimized") is not None:
             breaker_counterexample = breaker_report.get("minimized")
-        elif breaker_report.get("counterexamples"):
-            breaker_counterexample = breaker_report.get("counterexamples")[0]
+        else:
+            counterexamples = breaker_report.get("counterexamples") or []
+            if isinstance(counterexamples, list) and counterexamples:
+                breaker_counterexample = counterexamples[0]
         counterexample_hash = (
             stable_hash(breaker_counterexample) if breaker_counterexample is not None else ""
         )
@@ -641,5 +801,9 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         "warm_start_candidate_hash": warm_start_candidate_hash,
         "warm_start_candidate_rejected": warm_start_candidate_rejected,
         "synth_ns": synth_cost,
+        "verify_ns": verify_cost,
+        "breaker_ns": breaker_cost,
+        "breaker_attempts": breaker_attempts,
+        "meta_cases": meta_cases,
         "failure_reason": failure_reason,
     }

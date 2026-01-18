@@ -33,6 +33,7 @@ def _pyexec_env() -> dict[str, str]:
 
 
 def _pyfunc_command(program_path: Path, entrypoint: str) -> List[str]:
+    program_path = program_path.resolve()
     script = (
         "import importlib, sys;"
         f"sys.path.insert(0, {str(PYTHON_ROOT)!r});"
@@ -320,12 +321,12 @@ def run_pyfunc_breaker(
     def _try_candidate(candidate: Dict[str, Any]) -> bool:
         nonlocal attempts
         fingerprint = stable_hash(candidate)
-        if fingerprint in seen:
-            return False
-        seen.add(fingerprint)
         if attempts >= max_attempts:
             return True
         attempts += 1
+        if fingerprint in seen:
+            return attempts >= max_attempts
+        seen.add(fingerprint)
         is_cex, expected, got, failure_atoms = _evaluate_candidate(
             candidate, spec, program_path, entrypoint
         )

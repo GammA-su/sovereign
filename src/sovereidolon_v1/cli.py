@@ -416,7 +416,14 @@ def store_audit_cmd(
     programs = manifest.get("programs", {})
     errors: list[str] = []
     for program_hash, entry in programs.items():
-        default_path = store_dir / entry.get("domain", "") / f"{program_hash}.json"
+        domain = entry.get("domain", "")
+        if domain == "pyfunc":
+            ext = ".py"
+        elif domain == "codepatch":
+            ext = ".patch"
+        else:
+            ext = ".json"
+        default_path = store_dir / domain / f"{program_hash}{ext}"
         entry_path = Path(entry.get("store_path", default_path))
         if not entry_path.exists():
             errors.append(f"missing:{program_hash}")
@@ -442,10 +449,20 @@ def normalize_suite_report(report: dict[str, Any]) -> dict[str, Any]:
     for t in r.get("per_task", []):
         t.pop("synth_ns", None)
         t.pop("active_view_hash", None)
+        cost = t.get("cost")
+        if isinstance(cost, dict):
+            cost.pop("synth_ns", None)
+            cost.pop("verify_ns", None)
+            cost.pop("breaker_ns", None)
+            if not cost:
+                t.pop("cost", None)
         fd = t.get("forge_decision")
         if isinstance(fd, dict):
             fd.pop("witness_id", None)
             t["forge_decision"] = fd
+    totals = r.get("totals")
+    if isinstance(totals, dict):
+        totals.pop("verify_ns", None)
     for u in r.get("store_updates", []):
         sp = u.get("store_path")
         if isinstance(sp, str):
@@ -486,7 +503,7 @@ def suite_run_cmd(
         manifest = {"schema_version": "v1", "programs": {}}
     programs: dict[str, dict[str, Any]] = manifest.setdefault("programs", {})
 
-    totals = {"pass": 0, "fail": 0, "audit_failures": 0}
+    totals = {"pass": 0, "fail": 0, "audit_failures": 0, "verify_ns": 0, "breaker_attempts": 0}
     per_task: List[dict[str, Any]] = []
     store_updates: List[dict[str, str]] = []
 
@@ -518,6 +535,15 @@ def suite_run_cmd(
                 "status": "SKIPPED",
                 "reason": decision_data.get("reason", "CEGIS_UNSAT"),
             }
+        cost = {
+            "synth_ns": summary.get("synth_ns", 0),
+            "verify_ns": summary.get("verify_ns", 0),
+            "breaker_ns": summary.get("breaker_ns", 0),
+        }
+        attempts = {
+            "breaker_attempts": summary.get("breaker_attempts", 0),
+            "meta_cases": summary.get("meta_cases", 0),
+        }
         per_task.append(
             {
                 "task_id": summary["task_id"],
@@ -528,6 +554,8 @@ def suite_run_cmd(
                 "forge_decision": decision_data,
                 "audit_ok": audit_report["ok"],
                 "synth_ns": summary.get("synth_ns", 0),
+                "cost": cost,
+                "attempts": attempts,
                 "warm_start_store": summary.get("warm_start_store", False),
                 "warm_start_candidate_hash": summary.get("warm_start_candidate_hash", ""),
                 "warm_start_candidate_rejected": summary.get(
@@ -542,19 +570,30 @@ def suite_run_cmd(
             totals["fail"] += 1
         if not audit_report["ok"]:
             totals["audit_failures"] += 1
+        totals["verify_ns"] += int(cost.get("verify_ns", 0))
+        totals["breaker_attempts"] += int(attempts.get("breaker_attempts", 0))
         if decision_data.get("decision") == "ADMIT" and program_hash:
             program_entry = programs.get(program_hash)
             manifest_spec = task.spec_signature()
-            ext = ".py" if task.task_type == "pyfunc" else ".json"
+            if task.task_type == "pyfunc":
+                ext = ".py"
+            elif task.task_type == "codepatch":
+                ext = ".patch"
+            else:
+                ext = ".json"
             store_path = store_dir / task.task_type / f"{program_hash}{ext}"
             program_bytes: bytes | None = None
             artifact_base = actual_run / "artifacts"
             if task.task_type == "pyfunc":
                 run_program_path = artifact_base / "pyfunc" / "program.py"
+            elif task.task_type == "codepatch":
+                run_program_path = artifact_base / "codepatch" / "program.patch"
             else:
                 run_program_path = artifact_base / "bvps" / "program.json"
             if run_program_path.exists():
                 if task.task_type == "pyfunc":
+                    program_bytes = run_program_path.read_bytes()
+                elif task.task_type == "codepatch":
                     program_bytes = run_program_path.read_bytes()
                 else:
                     program_bytes = canonical_dumps(read_json(run_program_path))
@@ -565,7 +604,12 @@ def suite_run_cmd(
                     warm_programs = warm_manifest.get("programs", {})
                     warm_entry = warm_programs.get(program_hash, {})
                     warm_domain = warm_entry.get("domain", task.task_type)
-                    warm_ext = ".py" if warm_domain == "pyfunc" else ".json"
+                    if warm_domain == "pyfunc":
+                        warm_ext = ".py"
+                    elif warm_domain == "codepatch":
+                        warm_ext = ".patch"
+                    else:
+                        warm_ext = ".json"
                     warm_fallback = (
                         Path(settings.warm_start_store) / warm_domain / f"{program_hash}{warm_ext}"
                     )

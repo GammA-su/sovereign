@@ -1,0 +1,16 @@
+{
+  "task_id": "codepatch_escape_01",
+  "family": "codepatch",
+  "task_type": "codepatch",
+  "goal": "fix_tests",
+  "inputs": {},
+  "output": "patch",
+  "bounds": {},
+  "examples": [],
+  "metadata": {
+    "codepatch": {
+      "fixture": "examples/fixtures/mini_proj",
+      "candidate_patch": "--- a/../escape.txt\n+++ b/../escape.txt\n@@ -1,1 +1,1 @@\n-escape\n+escape\n"
+    }
+  }
+}

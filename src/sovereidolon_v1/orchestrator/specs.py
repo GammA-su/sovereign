@@ -54,6 +54,8 @@ class TaskSpec:
             if self.task.goal == "min":
                 return min(int_values) if int_values else 0
             return sum(int_values)
+        if self.task.task_type == "codepatch":
+            return True
         raise ValueError("unknown task type")
 
     def random_inputs(self, rng: random.Random) -> Dict[str, Any]:
@@ -78,6 +80,8 @@ class TaskSpec:
             for name in self.task.inputs.keys():
                 inputs[name] = bool(rng.randint(0, 1))
             return inputs
+        if self.task.task_type == "codepatch":
+            return {}
         raise ValueError("unknown task type")
 
     def generate_inputs(self, count: int, seed: int) -> Iterable[Dict[str, Any]]:

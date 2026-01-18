@@ -1,1 +1,0 @@
-{"arg_types":{"xs":"List[Int]"},"body":{"acc":"acc","body":{"kind":"binop","left":{"kind":"var","name":"acc"},"op":"+","right":{"kind":"var","name":"x"}},"bound":6,"init":{"kind":"int","value":0},"kind":"fold","list":{"kind":"var","name":"xs"},"var":"x"},"name":"sum","post":[],"pre":[],"return_type":"Int"}

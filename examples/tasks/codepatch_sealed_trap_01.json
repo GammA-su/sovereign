@@ -1,0 +1,24 @@
+{
+  "task_id": "codepatch_sealed_trap_01",
+  "family": "codepatch",
+  "task_type": "codepatch",
+  "goal": "fix_tests",
+  "inputs": {},
+  "output": "patch",
+  "bounds": {},
+  "examples": [],
+  "metadata": {
+    "description": "Sealed trap: passes base tests but fails withheld OFF_BY_ONE mutation.",
+    "codepatch": {
+      "fixture": "examples/fixtures/mini_proj",
+      "candidate_patch": "--- a/mini_proj/core.py\n+++ b/mini_proj/core.py\n@@ -4,2 +4,2 @@\n-def add(a: int, b: int) -> int:\n-    return a - b\n+def add(a: int, b: int) -> int:\n+    return a + b + 0\n"
+    }
+  },
+  "sealed": {
+    "sealed_seed": 4242,
+    "withheld_families": [
+      "OFF_BY_ONE"
+    ],
+    "canary_token": "CANARY_CODEPATCH"
+  }
+}

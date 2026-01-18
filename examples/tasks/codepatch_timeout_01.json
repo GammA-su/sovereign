@@ -1,0 +1,16 @@
+{
+  "task_id": "codepatch_timeout_01",
+  "family": "codepatch",
+  "task_type": "codepatch",
+  "goal": "fix_tests",
+  "inputs": {},
+  "output": "patch",
+  "bounds": {},
+  "examples": [],
+  "metadata": {
+    "codepatch": {
+      "fixture": "examples/fixtures/mini_proj",
+      "candidate_patch": "--- a/mini_proj/core.py\n+++ b/mini_proj/core.py\n@@ -5,1 +5,3 @@\n-    return a - b\n+    while True:\n+        a = a\n+    return a - b\n"
+    }
+  }
+}

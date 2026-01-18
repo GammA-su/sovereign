@@ -1,1 +1,0 @@
-{"arg_types":{"x":"Int","y":"Int"},"body":{"kind":"binop","left":{"kind":"var","name":"x"},"op":"+","right":{"kind":"var","name":"y"}},"name":"add","post":[],"pre":[],"return_type":"Int"}

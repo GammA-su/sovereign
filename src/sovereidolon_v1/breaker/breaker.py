@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..bvps.interpreter import eval_program
+from ..codepatch.breaker import run_codepatch_breaker
 from ..config import Settings
 from ..orchestrator.specs import TaskSpec
 from ..orchestrator.task import Example, Task
@@ -121,6 +122,13 @@ class BreakerLab:
                 task,
                 program_path,
                 BreakerBudget(attempt_budget=budget),
+            )
+        if task.task_type == "codepatch":
+            return run_codepatch_breaker(
+                task,
+                program,
+                BreakerBudget(attempt_budget=budget),
+                self.run_dir,
             )
 
         if task.task_type not in {"arith", "list"}:

@@ -1,0 +1,19 @@
+{
+  "task_id": "pyfunc_breaker_dups_01",
+  "family": "pyfunc",
+  "task_type": "pyfunc",
+  "goal": "sum",
+  "inputs": {"x": "Int"},
+  "output": "Int",
+  "bounds": {"x": [0, 0]},
+  "examples": [
+    {"inputs": {"x": 0}, "output": 0}
+  ],
+  "metadata": {
+    "pyfunc": {
+      "candidate_program": "def solve(x):\n    return x\n",
+      "entrypoint": "solve",
+      "metamorphic": []
+    }
+  }
+}

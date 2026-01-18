@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +20,9 @@ from hypothesis import settings as hypo_settings
 from hypothesis import strategies as st
 
 from ..bvps.interpreter import eval_program
+from ..codepatch.applier import apply_patch, parse_unified_diff
+from ..codepatch.runner import default_test_command, run_codepatch, run_tests_in_dir
+from ..codepatch.validator import extract_patch_paths, validate_patch
 from ..config import Settings
 from ..ledger.ledger import Ledger
 from ..orchestrator.specs import TaskSpec
@@ -322,6 +328,9 @@ def transfer_lane(ctx: VerifierContext) -> VerifierVerdict:
 
 
 PYTHON_ROOT = Path(__file__).resolve().parents[2]
+_RUNNER_METAMORPHIC = {"commutative", "idempotent"}
+_DERIVED_METAMORPHIC = {"reverse_args", "duplicate_inputs", "permute_examples"}
+_CODEPATCH_METAMORPHIC = {"whitespace_idempotent", "apply_revert_apply", "commutation_safe"}
 
 
 def _pyexec_env() -> dict[str, str]:
@@ -336,61 +345,81 @@ def _pyexec_env() -> dict[str, str]:
     }
 
 
-def pyexec_lane(ctx: VerifierContext) -> VerifierVerdict:
-    start = time.time_ns()
+def _run_pyexec_tests(
+    program_path: Path,
+    entrypoint: str,
+    tests: List[Dict[str, Any]],
+    metamorphic: List[str],
+) -> tuple[str, List[str], List[str]]:
     failure_atoms: List[str] = []
     metamorphic_families: List[str] = []
-    program_path = Path(ctx.run_dir).resolve() / "artifacts" / "pyfunc" / "program.py"
     verdict = "FAIL"
     if not program_path.exists():
         failure_atoms.append("EXCEPTION:MISSING_PROGRAM")
-    else:
-        payload = {
-            "tests": [example.model_dump() for example in ctx.tests],
-            "metamorphic": ctx.task.metadata.get("pyfunc", {}).get("metamorphic", []),
-        }
-        entrypoint = ctx.task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
-        script = (
-            "import importlib, sys; "
-            f"sys.path.insert(0, {str(PYTHON_ROOT)!r}); "
-            "import sovereidolon_v1.pyfunc.runner as runner; "
-            "runner.main()"
-        )
-        try:
-            with tempfile.TemporaryDirectory() as workdir:
-                proc = subprocess.run(
-                    [
-                        sys.executable,
-                        "-I",
-                        "-c",
-                        script,
-                        "--program",
-                        str(program_path),
-                        "--entrypoint",
-                        entrypoint,
-                    ],
-                    input=json.dumps(payload),
-                    text=True,
-                    capture_output=True,
-                    timeout=1.0,
-                    env=_pyexec_env(),
-                    cwd=workdir,
-                )
-        except subprocess.TimeoutExpired:
-            failure_atoms.append("TIMEOUT")
-        else:
-            if proc.returncode != 0:
-                failure_atoms.append(
-                    "RESOURCE_LIMIT" if proc.returncode < 0 else "EXCEPTION:RUNNER_ERROR"
-                )
-            try:
-                result = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                failure_atoms.append("EXCEPTION:BAD_OUTPUT")
+        return verdict, failure_atoms, metamorphic_families
+    payload = {"tests": tests, "metamorphic": metamorphic}
+    script = (
+        "import importlib, sys; "
+        f"sys.path.insert(0, {str(PYTHON_ROOT)!r}); "
+        "import sovereidolon_v1.pyfunc.runner as runner; "
+        "runner.main()"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as workdir:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    script,
+                    "--program",
+                    str(program_path),
+                    "--entrypoint",
+                    entrypoint,
+                ],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+                env=_pyexec_env(),
+                cwd=workdir,
+            )
+    except subprocess.TimeoutExpired:
+        failure_atoms.append("TIMEOUT")
+        return verdict, failure_atoms, metamorphic_families
+    if proc.returncode != 0:
+        if proc.returncode < 0:
+            signal_num = -proc.returncode
+            if signal_num in {signal.SIGXCPU, signal.SIGALRM, signal.SIGKILL}:
+                failure_atoms.append("TIMEOUT")
             else:
-                verdict = result.get("verdict", "FAIL")
-                failure_atoms.extend(result.get("failure_atoms", []))
-                metamorphic_families = result.get("metamorphic_families", [])
+                failure_atoms.append("RESOURCE_LIMIT")
+        else:
+            failure_atoms.append("EXCEPTION:RUNNER_ERROR")
+        return verdict, failure_atoms, metamorphic_families
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        failure_atoms.append("EXCEPTION:BAD_OUTPUT")
+        return verdict, failure_atoms, metamorphic_families
+    verdict = result.get("verdict", "FAIL")
+    failure_atoms.extend(result.get("failure_atoms", []))
+    metamorphic_families = result.get("metamorphic_families", [])
+    return verdict, failure_atoms, metamorphic_families
+
+
+def pyexec_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    program_path = Path(ctx.run_dir).resolve() / "artifacts" / "pyfunc" / "program.py"
+    entrypoint = ctx.task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
+    configured = ctx.task.metadata.get("pyfunc", {}).get("metamorphic", [])
+    runner_metamorphic = [name for name in configured if name in _RUNNER_METAMORPHIC]
+    verdict, failure_atoms, metamorphic_families = _run_pyexec_tests(
+        program_path,
+        entrypoint,
+        [example.model_dump() for example in ctx.tests],
+        runner_metamorphic,
+    )
     if not failure_atoms and verdict == "PASS":
         final_verdict: Literal["PASS", "FAIL"] = "PASS"
     else:
@@ -404,5 +433,360 @@ def pyexec_lane(ctx: VerifierContext) -> VerifierVerdict:
         bounds=ctx.task.bounds,
         soundness_grade="BOUNDED",
         metamorphic_families=metamorphic_families,
+        cost=cost,
+    )
+
+
+def _pyfunc_metamorphic_tests(
+    ctx: VerifierContext, family: str
+) -> List[Dict[str, Any]]:
+    derived: List[Dict[str, Any]] = []
+    if family == "reverse_args":
+        if "a" not in ctx.task.inputs or "b" not in ctx.task.inputs:
+            return []
+        for example in ctx.tests:
+            swapped = dict(example.inputs)
+            swapped["a"], swapped["b"] = swapped.get("b"), swapped.get("a")
+            derived.append({"inputs": swapped, "output": ctx.spec.evaluate(swapped)})
+        return derived
+    if family == "duplicate_inputs":
+        for example in ctx.tests:
+            inputs = dict(example.inputs)
+            expected = ctx.spec.evaluate(inputs)
+            derived.append({"inputs": inputs, "output": expected})
+            derived.append({"inputs": inputs, "output": expected})
+        return derived
+    if family == "permute_examples":
+        for example in reversed(ctx.tests):
+            inputs = dict(example.inputs)
+            derived.append({"inputs": inputs, "output": ctx.spec.evaluate(inputs)})
+        return derived
+    return []
+
+
+def pyexec_metamorphic_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    metamorphic_families: List[str] = []
+    tests_run = 0
+    configured = ctx.task.metadata.get("pyfunc", {}).get("metamorphic", [])
+    selected = [name for name in configured if name in _DERIVED_METAMORPHIC]
+    if selected:
+        program_path = Path(ctx.run_dir).resolve() / "artifacts" / "pyfunc" / "program.py"
+        entrypoint = ctx.task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
+        for family in selected:
+            derived_tests = _pyfunc_metamorphic_tests(ctx, family)
+            if not derived_tests:
+                continue
+            metamorphic_families.append(family)
+            tests_run += len(derived_tests)
+            verdict, failure_detail, _ = _run_pyexec_tests(
+                program_path,
+                entrypoint,
+                derived_tests,
+                [],
+            )
+            if verdict != "PASS" or failure_detail:
+                failure_atoms.append(f"METAMORPHIC_VIOLATION:{family}")
+    final_verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": tests_run}
+    return VerifierVerdict(
+        verdict=final_verdict,
+        failure_atoms=failure_atoms,
+        domain="pyfunc",
+        tier="metamorphic",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=metamorphic_families,
+        cost=cost,
+    )
+
+
+def _codepatch_patch_text(ctx: VerifierContext) -> str:
+    patch_text = getattr(ctx.program, "patch", "") if ctx.program is not None else ""
+    if not patch_text:
+        patch_text = ctx.task.metadata.get("codepatch", {}).get("candidate_patch", "")
+    return patch_text
+
+
+def _strip_trailing_whitespace(paths: List[str], root: Path) -> None:
+    for relpath in paths:
+        target = root / relpath
+        if not target.exists():
+            continue
+        lines = target.read_text(encoding="utf-8").splitlines()
+        trimmed = [line.rstrip() for line in lines]
+        target.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
+
+
+def _diff_patch(paths: List[str], from_root: Path, to_root: Path) -> str:
+    diff_lines: List[str] = []
+    for relpath in sorted(paths):
+        from_path = from_root / relpath
+        to_path = to_root / relpath
+        from_lines = (
+            from_path.read_text(encoding="utf-8").splitlines() if from_path.exists() else []
+        )
+        to_lines = to_path.read_text(encoding="utf-8").splitlines() if to_path.exists() else []
+        diff_lines.extend(
+            difflib.unified_diff(
+                from_lines,
+                to_lines,
+                fromfile=f"a/{relpath}",
+                tofile=f"b/{relpath}",
+                lineterm="",
+            )
+        )
+    if not diff_lines:
+        return ""
+    return "\n".join(diff_lines) + "\n"
+
+
+def _find_subsequence(lines: List[str], expected: List[str]) -> int:
+    if not expected:
+        return 0
+    limit = len(lines) - len(expected) + 1
+    for idx in range(limit):
+        if lines[idx : idx + len(expected)] == expected:
+            return idx
+    return -1
+
+
+def _apply_hunks_search(lines: List[str], hunks: List[Any]) -> tuple[List[str], bool]:
+    for hunk in hunks:
+        expected: List[str] = []
+        replacement: List[str] = []
+        for raw_line in hunk.lines:
+            prefix = raw_line[:1]
+            payload = raw_line[1:] if len(raw_line) > 0 else ""
+            if prefix in {" ", "-"}:
+                expected.append(payload)
+            if prefix in {" ", "+"}:
+                replacement.append(payload)
+        idx = _find_subsequence(lines, expected)
+        if idx < 0:
+            return lines, False
+        lines[idx : idx + len(expected)] = replacement
+    return lines, True
+
+
+def _hunks_non_overlapping(hunks: List[Any]) -> bool:
+    ranges: List[tuple[int, int]] = []
+    for hunk in hunks:
+        start = int(hunk.old_start)
+        count = max(1, int(hunk.old_count))
+        end = start + count - 1
+        ranges.append((start, end))
+    ranges.sort()
+    last_end = -1
+    for start, end in ranges:
+        if start <= last_end:
+            return False
+        last_end = end
+    return True
+
+
+def _apply_patch_commuted(patch: str, root: Path) -> bool:
+    patches = parse_unified_diff(patch)
+    if not patches:
+        return False
+    for file_patch in patches:
+        if file_patch.is_delete:
+            return False
+        path = root / file_patch.path
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+        else:
+            if not file_patch.is_new:
+                return False
+            lines = []
+        hunks = list(reversed(file_patch.hunks))
+        updated, ok = _apply_hunks_search(lines, hunks)
+        if not ok:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    return True
+
+
+def codepatch_metamorphic_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    metamorphic_families: List[str] = []
+    tests_run = 0
+
+    meta = ctx.task.metadata.get("codepatch", {})
+    configured = meta.get("metamorphic", [])
+    selected = [name for name in configured if name in _CODEPATCH_METAMORPHIC]
+    patch_text = _codepatch_patch_text(ctx)
+    fixture = meta.get("fixture")
+    fixture_path = Path(fixture) if fixture else None
+
+    if not selected or not patch_text or not fixture_path or not fixture_path.exists():
+        cost = {"ns": time.time_ns() - start, "tests": tests_run}
+        return VerifierVerdict(
+            verdict="PASS",
+            failure_atoms=[],
+            domain="codepatch",
+            tier="metamorphic",
+            bounds=ctx.task.bounds,
+            soundness_grade="BOUNDED",
+            metamorphic_families=[],
+            cost=cost,
+        )
+
+    forbidden_targets = meta.get("forbidden_targets", [])
+    validation_error = validate_patch(patch_text, forbidden_targets)
+    if validation_error:
+        cost = {"ns": time.time_ns() - start, "tests": tests_run}
+        return VerifierVerdict(
+            verdict="PASS",
+            failure_atoms=[],
+            domain="codepatch",
+            tier="metamorphic",
+            bounds=ctx.task.bounds,
+            soundness_grade="BOUNDED",
+            metamorphic_families=[],
+            cost=cost,
+        )
+
+    test_command = meta.get("test_command", default_test_command())
+    timeout_s = float(meta.get("timeout_s", 2.0))
+    paths = extract_patch_paths(patch_text)
+
+    for family in selected:
+        applicable = True
+        family_failed = False
+        if family == "whitespace_idempotent":
+            with tempfile.TemporaryDirectory() as workdir:
+                fixture_root = Path(workdir) / "fixture"
+                shutil.copytree(fixture_path, fixture_root)
+                applied, _ = apply_patch(patch_text, fixture_root)
+                if not applied:
+                    applicable = False
+                else:
+                    _strip_trailing_whitespace(paths, fixture_root)
+                    result = run_tests_in_dir(
+                        fixture_root, list(test_command), timeout_s=timeout_s
+                    )
+                    tests_run += result.tests_run
+                    family_failed = result.verdict != "PASS" or bool(result.failure_atoms)
+        elif family == "apply_revert_apply":
+            with tempfile.TemporaryDirectory() as workdir:
+                fixture_root = Path(workdir) / "fixture"
+                shutil.copytree(fixture_path, fixture_root)
+                original_root = Path(workdir) / "original"
+                shutil.copytree(fixture_path, original_root)
+                applied, _ = apply_patch(patch_text, fixture_root)
+                if not applied:
+                    applicable = False
+                else:
+                    revert_patch = _diff_patch(paths, fixture_root, original_root)
+                    if revert_patch:
+                        reverted, _ = apply_patch(revert_patch, fixture_root)
+                    else:
+                        reverted = True
+                    re_applied, _ = apply_patch(patch_text, fixture_root)
+                    if not (reverted and re_applied):
+                        family_failed = True
+                    else:
+                        result = run_tests_in_dir(
+                            fixture_root, list(test_command), timeout_s=timeout_s
+                        )
+                        tests_run += result.tests_run
+                        family_failed = result.verdict != "PASS" or bool(
+                            result.failure_atoms
+                        )
+        elif family == "commutation_safe":
+            parsed = parse_unified_diff(patch_text)
+            if not parsed:
+                applicable = False
+            else:
+                has_multi = False
+                for file_patch in parsed:
+                    if len(file_patch.hunks) > 1:
+                        has_multi = True
+                        if not _hunks_non_overlapping(file_patch.hunks):
+                            applicable = False
+                            break
+                if not has_multi:
+                    applicable = False
+            if applicable:
+                with tempfile.TemporaryDirectory() as workdir:
+                    fixture_root = Path(workdir) / "fixture"
+                    shutil.copytree(fixture_path, fixture_root)
+                    applied = _apply_patch_commuted(patch_text, fixture_root)
+                    if not applied:
+                        family_failed = True
+                    else:
+                        result = run_tests_in_dir(
+                            fixture_root, list(test_command), timeout_s=timeout_s
+                        )
+                        tests_run += result.tests_run
+                        family_failed = result.verdict != "PASS" or bool(
+                            result.failure_atoms
+                        )
+
+        if not applicable:
+            continue
+        metamorphic_families.append(family)
+        if family_failed:
+            failure_atoms.append(f"METAMORPHIC_VIOLATION:{family}")
+
+    final_verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": tests_run}
+    return VerifierVerdict(
+        verdict=final_verdict,
+        failure_atoms=failure_atoms,
+        domain="codepatch",
+        tier="metamorphic",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=metamorphic_families,
+        cost=cost,
+    )
+
+
+def codepatch_lane(ctx: VerifierContext) -> VerifierVerdict:
+    start = time.time_ns()
+    failure_atoms: List[str] = []
+    tests_run = 0
+    meta = ctx.task.metadata.get("codepatch", {})
+    fixture = meta.get("fixture")
+    if not fixture:
+        failure_atoms.append("EXCEPTION:MISSING_FIXTURE")
+    else:
+        fixture_path = Path(fixture)
+        if not fixture_path.exists():
+            failure_atoms.append("EXCEPTION:MISSING_FIXTURE")
+        else:
+            patch_text = getattr(ctx.program, "patch", "") if ctx.program is not None else ""
+            if not patch_text:
+                patch_text = meta.get("candidate_patch", "")
+            if not patch_text:
+                failure_atoms.append("EXCEPTION:MISSING_PATCH")
+            else:
+                forbidden_targets = meta.get("forbidden_targets", [])
+                test_command = meta.get("test_command", default_test_command())
+                timeout_s = float(meta.get("timeout_s", 2.0))
+                result = run_codepatch(
+                    patch_text,
+                    fixture_path,
+                    list(test_command),
+                    forbidden_targets,
+                    timeout_s=timeout_s,
+                )
+                tests_run = result.tests_run
+                failure_atoms.extend(result.failure_atoms)
+    verdict: Literal["PASS", "FAIL"] = "PASS" if not failure_atoms else "FAIL"
+    cost = {"ns": time.time_ns() - start, "tests": tests_run}
+    return VerifierVerdict(
+        verdict=verdict,
+        failure_atoms=failure_atoms,
+        domain="codepatch",
+        tier="codepatch",
+        bounds=ctx.task.bounds,
+        soundness_grade="BOUNDED",
+        metamorphic_families=[],
         cost=cost,
     )

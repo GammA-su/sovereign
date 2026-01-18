@@ -26,7 +26,7 @@ from sovereidolon_v1.orchestrator.episode import episode_run
 from sovereidolon_v1.orchestrator.specs import task_spec
 from sovereidolon_v1.orchestrator.task import Example, Task
 from sovereidolon_v1.schemas import BGRevisionOp, VerifierVerdict
-from sovereidolon_v1.utils import hash_bytes, read_json, stable_hash
+from sovereidolon_v1.utils import hash_bytes, read_json, read_jsonl, stable_hash
 
 
 def test_ledger_chain_verification(tmp_path: Path) -> None:
@@ -501,6 +501,36 @@ def _pyexec_failure_atoms(run_dir: Path) -> list[str]:
     raise AssertionError("pyexec verdict missing")
 
 
+def _codepatch_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "codepatch" and entry.get("tier") == "codepatch":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("codepatch verdict missing")
+
+
+def _codepatch_meta_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "codepatch" and entry.get("tier") == "metamorphic":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("codepatch metamorphic verdict missing")
+
+
+def _pymeta_failure_atoms(run_dir: Path) -> list[str]:
+    report_path = run_dir / "artifacts" / "reports" / "verifier.json"
+    assert report_path.exists(), "verifier report missing"
+    verdicts = read_json(report_path)
+    for entry in verdicts:
+        if entry.get("domain") == "pyfunc" and entry.get("tier") == "metamorphic":
+            return entry.get("failure_atoms", [])
+    raise AssertionError("pyfunc metamorphic verdict missing")
+
+
 def _pybreaker_failure_atoms(run_dir: Path) -> list[str]:
     report_path = run_dir / "artifacts" / "reports" / "verifier.json"
     assert report_path.exists(), "verifier report missing"
@@ -537,6 +567,119 @@ def test_pyfunc_adversarial_failure_atoms(tmp_path: Path) -> None:
             assert atom in failure_atoms
 
 
+def test_codepatch_pass_fail(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir_pass = tmp_path / "codepatch_pass"
+    summary_pass = episode_run(
+        task_file=Path("examples/tasks/codepatch_pass_01.json"),
+        run_dir=run_dir_pass,
+        settings=settings,
+    )
+    assert summary_pass["verdict"] == "PASS"
+
+    run_dir_fail = tmp_path / "codepatch_fail"
+    summary_fail = episode_run(
+        task_file=Path("examples/tasks/codepatch_fail_01.json"),
+        run_dir=run_dir_fail,
+        settings=settings,
+    )
+    assert summary_fail["verdict"] == "FAIL"
+    failure_atoms = _codepatch_failure_atoms(run_dir_fail)
+    assert "TESTS_FAILED" in failure_atoms
+
+
+def test_codepatch_adversarial_failures(tmp_path: Path) -> None:
+    settings = Settings()
+    tasks = [
+        ("codepatch_fail_apply_01.json", "PATCH_APPLY_FAILED"),
+        ("codepatch_fail_tests_01.json", "TESTS_FAILED"),
+        ("codepatch_escape_01.json", "PATCH_PATH_ESCAPE"),
+        ("codepatch_timeout_01.json", "TIMEOUT"),
+    ]
+    for task_file, expected_atom in tasks:
+        run_dir = tmp_path / task_file
+        summary = episode_run(
+            task_file=Path(f"examples/tasks/{task_file}"),
+            run_dir=run_dir,
+            settings=settings,
+        )
+        assert summary["verdict"] == "FAIL", task_file
+        decision_path = run_dir / "forge" / "decision.json"
+        if decision_path.exists():
+            decision = read_json(decision_path)
+            assert decision["decision"] != "ADMIT"
+        ledger_entries = read_jsonl(run_dir / "ledger.jsonl")
+        assert not any(entry.get("type") == "FORGE_ADMIT" for entry in ledger_entries)
+        failure_atoms = _codepatch_failure_atoms(run_dir)
+        assert expected_atom in failure_atoms
+
+
+def test_codepatch_breaker_trap(tmp_path: Path) -> None:
+    settings = Settings(break_budget_attempts=10)
+    run_dir = tmp_path / "codepatch_breaker_trap"
+    summary = episode_run(
+        task_file=Path("examples/tasks/codepatch_breaker_trap_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+    breaker_report = read_json(run_dir / "artifacts" / "reports" / "breaker.json")
+    assert breaker_report.get("counterexamples"), "expected breaker counterexample"
+    attempts = int(breaker_report.get("attempts", 0))
+    assert 0 < attempts <= settings.break_budget_attempts
+    failure_atoms = breaker_report.get("failure_atoms", [])
+    assert "BREAKER_FOUND:EARLY_RETURN_REMOVAL" in failure_atoms
+    assert "COUNTEREXAMPLE_MINIMIZED" in failure_atoms
+    minimized_path = breaker_report.get("minimized_path", "")
+    assert minimized_path
+    assert Path(minimized_path).exists()
+
+
+def test_codepatch_metamorphic_failure_atoms(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "codepatch_meta_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/codepatch_meta_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    decision_path = run_dir / "forge" / "decision.json"
+    if decision_path.exists():
+        decision = read_json(decision_path)
+        assert decision["decision"] != "ADMIT"
+    failure_atoms = _codepatch_meta_failure_atoms(run_dir)
+    assert "METAMORPHIC_VIOLATION:whitespace_idempotent" in failure_atoms
+
+
+def test_codepatch_sealed_trap(tmp_path: Path) -> None:
+    settings = Settings(break_budget_attempts=10)
+    run_dir = tmp_path / "codepatch_sealed_trap"
+    summary = episode_run(
+        task_file=Path("examples/tasks/codepatch_sealed_trap_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    breaker_report = read_json(run_dir / "artifacts" / "reports" / "breaker.json")
+    assert breaker_report.get("withheld_hits", 0) > 0
+    failure_atoms = breaker_report.get("failure_atoms", [])
+    assert "BREAKER_FOUND:OFF_BY_ONE" in failure_atoms
+
+
+def test_pyfunc_metamorphic_failure_atoms(tmp_path: Path) -> None:
+    settings = Settings()
+    run_dir = tmp_path / "pyfunc_meta_fail"
+    summary = episode_run(
+        task_file=Path("examples/tasks/pyfunc_meta_fail_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "FAIL"
+    failure_atoms = _pymeta_failure_atoms(run_dir)
+    assert "METAMORPHIC_VIOLATION:duplicate_inputs" in failure_atoms
+
+
 def test_pyfunc_breaker_trap_capsule(tmp_path: Path) -> None:
     settings = Settings()
     run_dir = tmp_path / "pyfunc_breaker_trap"
@@ -560,6 +703,22 @@ def test_pyfunc_breaker_trap_capsule(tmp_path: Path) -> None:
     inputs = counterexample.get("inputs", {})
     assert inputs.get("a") == 0
     assert inputs.get("b") == 1
+
+
+def test_pyfunc_breaker_duplicate_budget_terminates(tmp_path: Path) -> None:
+    settings = Settings(break_budget_attempts=5)
+    run_dir = tmp_path / "pyfunc_breaker_dups"
+    summary = episode_run(
+        task_file=Path("examples/tasks/pyfunc_breaker_dups_01.json"),
+        run_dir=run_dir,
+        settings=settings,
+    )
+    assert summary["verdict"] == "PASS"
+    breaker_kpi_path = run_dir / "artifacts" / "reports" / "breaker_kpi.json"
+    assert breaker_kpi_path.exists()
+    breaker_kpi = read_json(breaker_kpi_path)
+    assert breaker_kpi.get("window", {}).get("attempts") == settings.break_budget_attempts
+    assert breaker_kpi.get("budget", {}).get("attempt_budget") == settings.break_budget_attempts
 
 
 def test_suite_run_reports(tmp_path: Path) -> None:
@@ -989,6 +1148,74 @@ def test_suite_v4_baseline(tmp_path: Path) -> None:
     assert audit_result.exit_code == 0
 
 
+def test_suite_v5_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_v5"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v5.json",
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report_norm = read_json(out_dir / "report.norm.json")
+    baseline = read_json(Path("examples/baselines/suite_v5.report.norm.json"))
+    assert report_norm == baseline
+    norm_text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_dir / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v6_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_dir = tmp_path / "suite_v6"
+    result = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v6.json",
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0
+
+    report_norm = read_json(out_dir / "report.norm.json")
+    baseline = read_json(Path("examples/baselines/suite_v6.report.norm.json"))
+    assert report_norm == baseline
+    norm_text = (out_dir / "report.norm.json").read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+    audit_result = runner.invoke(
+        app,
+        [
+            "store",
+            "audit",
+            "--store",
+            str(out_dir / "store"),
+        ],
+    )
+    assert audit_result.exit_code == 0
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_dir / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
 def test_suite_v3_warm_regression(tmp_path: Path) -> None:
     runner = CliRunner()
     out_a = tmp_path / "suite_v3_warm_a"
@@ -1027,6 +1254,66 @@ def test_suite_v3_warm_regression(tmp_path: Path) -> None:
     assert norm_text.endswith("\n")
     report_norm = read_json(norm_path)
     baseline = read_json(Path("examples/baselines/suite_v3_warm.report.norm.json"))
+    assert report_norm == baseline
+
+    audit_result = runner.invoke(
+        app,
+        ["store", "audit", "--store", str(out_b / "store")],
+    )
+    assert audit_result.exit_code == 0
+
+
+def test_suite_v6_warm_regression(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_a = tmp_path / "suite_v6_warm_a"
+    out_b = tmp_path / "suite_v6_warm_b"
+    result_a = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v6.json",
+            "--out-dir",
+            str(out_a),
+        ],
+    )
+    assert result_a.exit_code == 0
+
+    result_b = runner.invoke(
+        app,
+        [
+            "suite",
+            "run",
+            "--suite-file",
+            "examples/suites/suite_v6.json",
+            "--out-dir",
+            str(out_b),
+            "--warm-start-store",
+            str(out_a / "store"),
+        ],
+    )
+    assert result_b.exit_code == 0
+
+    report_b = read_json(out_b / "report.json")
+    entry = next(task for task in report_b["per_task"] if task["task_id"] == "codepatch_pass_01")
+    assert entry["warm_start_store"]
+    assert entry["warm_start_provided"]
+    assert entry["synth_ns"] == 0
+    candidate_hash = entry["warm_start_candidate_hash"]
+    assert candidate_hash
+    warm_store_file = out_b / "store" / "codepatch" / f"{candidate_hash}.patch"
+    assert warm_store_file.exists()
+    manifest_b = read_json(out_b / "store" / "manifest.json")
+    manifest_entry = manifest_b.get("programs", {}).get(candidate_hash, {})
+    assert manifest_entry.get("store_path") == str(warm_store_file)
+
+    norm_path = out_b / "report.norm.json"
+    assert norm_path.exists()
+    norm_text = norm_path.read_text(encoding="utf-8")
+    assert norm_text.endswith("\n")
+    report_norm = read_json(norm_path)
+    baseline = read_json(Path("examples/baselines/suite_v6_warm.report.norm.json"))
     assert report_norm == baseline
 
     audit_result = runner.invoke(

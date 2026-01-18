@@ -1,0 +1,14 @@
+{
+  "suite_id": "suite_v6",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/pyfunc_fail_01.json"},
+    {"task_file": "examples/tasks/codepatch_pass_01.json"},
+    {"task_file": "examples/tasks/codepatch_meta_fail_01.json"},
+    {"task_file": "examples/tasks/codepatch_sealed_trap_01.json"},
+    {"task_file": "examples/tasks/codepatch_fail_apply_01.json"},
+    {"task_file": "examples/tasks/codepatch_fail_tests_01.json"},
+    {"task_file": "examples/tasks/codepatch_escape_01.json"},
+    {"task_file": "examples/tasks/codepatch_timeout_01.json"}
+  ]
+}
