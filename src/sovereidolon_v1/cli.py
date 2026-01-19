@@ -442,8 +442,20 @@ def normalize_suite_report(report: dict[str, Any]) -> dict[str, Any]:
             marker = "/store/"
             if marker in sp:
                 u["store_path"] = "store/" + sp.split(marker, 1)[1]
-            else:
-                u.pop("store_path", None)
+                continue
+            if sp.startswith("store/"):
+                u["store_path"] = sp
+                continue
+            parts = [part for part in sp.split("/") if part]
+            if "store" in parts:
+                idx = parts.index("store")
+                suffix = "/".join(parts[idx + 1 :])
+                if suffix:
+                    u["store_path"] = "store/" + suffix
+                else:
+                    u["store_path"] = "store"
+                continue
+            u["store_path"] = sp
     return r
 
 
@@ -451,6 +463,43 @@ def ensure_trailing_newline(path: Path) -> None:
     data = path.read_bytes()
     if not data.endswith(b"\n"):
         path.write_bytes(data + b"\n")
+
+
+def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
+    suite_data = read_json(suite_file)
+    suite_id = suite_data.get("suite_id", suite_file.stem)
+    tasks = suite_data.get("tasks", [])
+    per_task = {
+        task.get("task_id"): task for task in report.get("per_task", []) if isinstance(task, dict)
+    }
+    totals = {"pass": 0, "fail": 0}
+    per_domain: dict[str, dict[str, int]] = {}
+    tasks_summary: list[dict[str, str]] = []
+    for entry in tasks:
+        if not isinstance(entry, dict):
+            continue
+        task_file = Path(entry.get("task_file", ""))
+        if not task_file:
+            continue
+        task = load_task(task_file)
+        entry_report = per_task.get(task.task_id, {})
+        verdict = str(entry_report.get("verdict", "FAIL"))
+        tasks_summary.append({"task_id": task.task_id, "verdict": verdict})
+        if verdict == "PASS":
+            totals["pass"] += 1
+        else:
+            totals["fail"] += 1
+        domain_counts = per_domain.setdefault(task.task_type, {"pass": 0, "fail": 0})
+        if verdict == "PASS":
+            domain_counts["pass"] += 1
+        else:
+            domain_counts["fail"] += 1
+    return {
+        "suite_id": suite_id,
+        "totals": totals,
+        "per_domain": per_domain,
+        "tasks": tasks_summary,
+    }
 
 
 @suite_app.command("run")
@@ -658,6 +707,28 @@ def suite_run_cmd(
     write_json(norm_path, norm_report)
     ensure_trailing_newline(norm_path)
     console.print({"report": str(report_path)})
+
+
+@suite_app.command("run-sealed")
+def suite_run_sealed_cmd(
+    suite_file: Path = SUITE_FILE_OPTION,
+    out_dir: Path = OUT_DIR_OPTION,
+    policy_version: str = POLICY_OPTION,
+    warm_start_store: Optional[Path] = SUITE_WARM_START_OPTION,
+) -> None:
+    suite_run_cmd(
+        suite_file=suite_file,
+        out_dir=out_dir,
+        policy_version=policy_version,
+        warm_start_store=warm_start_store,
+    )
+    report_path = Path(out_dir) / "report.json"
+    report = read_json(report_path)
+    summary = _sealed_summary(suite_file, report)
+    summary_path = Path(out_dir) / "sealed_summary.json"
+    write_json(summary_path, summary)
+    ensure_trailing_newline(summary_path)
+    console.print({"sealed_summary": str(summary_path)})
 
 
 @demo_app.command("bg")

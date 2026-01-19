@@ -1,0 +1,7 @@
+{
+  "suite_id": "sealed_v1",
+  "tasks": [
+    {"task_file": "examples/tasks/arith_01.json"},
+    {"task_file": "examples/tasks/bool_01.json"}
+  ]
+}
