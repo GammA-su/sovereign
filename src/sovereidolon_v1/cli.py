@@ -21,7 +21,15 @@ from .proposer_api import BaseProposer, ReplayProposer, StaticProposer, Subproce
 from .pyfunc.runner import PYEXEC_VERSION
 from .schemas import UCR, export_schemas
 from .store.audit import audit_store
-from .utils import canonical_dumps, ensure_dir, hash_bytes, read_json, read_jsonl, write_json
+from .utils import (
+    canonical_dumps,
+    ensure_dir,
+    hash_bytes,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl_line,
+)
 
 app = typer.Typer(help="SOVEREIDOLON v1 CLI")
 console = Console()
@@ -50,6 +58,7 @@ PROPOSER_OPTION = typer.Option("stub", "--proposer")
 STATIC_PROGRAM_OPTION = typer.Option(None, "--static-program")
 REPLAY_FILE_OPTION = typer.Option(None, "--replay-file")
 CMD_OPTION = typer.Option(None, "--cmd")
+RECORD_PROPOSALS_OPTION = typer.Option(None, "--record-proposals")
 
 
 episode_app = typer.Typer(help="Episode commands")
@@ -737,12 +746,21 @@ def suite_run_cmd(
     out_dir: Path = OUT_DIR_OPTION,
     policy_version: str = POLICY_OPTION,
     warm_start_store: Optional[Path] = SUITE_WARM_START_OPTION,
+    proposer_kind: str = PROPOSER_OPTION,
+    static_program: Optional[str] = STATIC_PROGRAM_OPTION,
+    replay_file: Optional[Path] = REPLAY_FILE_OPTION,
+    cmd: Optional[List[str]] = CMD_OPTION,
+    record_proposals: Optional[Path] = RECORD_PROPOSALS_OPTION,
 ) -> None:
     suite_data = read_json(suite_file)
     suite_id = suite_data.get("suite_id", suite_file.stem)
     tasks = suite_data.get("tasks", [])
     report_dir = out_dir
     ensure_dir(report_dir)
+    proposer = _build_proposer(proposer_kind, static_program, replay_file, cmd)
+    record_path = Path(record_proposals) if record_proposals else None
+    if record_path and record_path.exists():
+        record_path.unlink()
 
     store_dir = report_dir / "store"
     ensure_dir(store_dir)
@@ -767,9 +785,32 @@ def suite_run_cmd(
             overrides["warm_start_store"] = str(warm_start_store)
         settings = Settings(**overrides)
         task_run_dir = report_dir / task_file.stem
-        summary = episode_run(task_file=task_file, run_dir=task_run_dir, settings=settings)
+        summary = episode_run(
+            task_file=task_file,
+            run_dir=task_run_dir,
+            settings=settings,
+            proposer=proposer,
+        )
         actual_run = Path(summary["ucr_path"]).parent
         audit_report = audit_run(actual_run)
+        if record_path is not None:
+            proposer_path = actual_run / "proposer.json"
+            if proposer_path.exists():
+                proposer_record = read_json(proposer_path)
+            else:
+                proposer_record = {"error_atom": "PROPOSER_RECORD_MISSING"}
+            record_entry = {
+                "task_id": task.task_id,
+                "domain": task.task_type,
+                "spec_signature": task.spec_signature(),
+                "proposer_id": proposer_record.get("proposer_id", ""),
+                "proposal_hash": proposer_record.get("proposal_hash", ""),
+                "candidate_program": proposer_record.get("candidate_program", ""),
+            }
+            error_atom = proposer_record.get("error_atom")
+            if error_atom:
+                record_entry["error_atom"] = error_atom
+            write_jsonl_line(record_path, record_entry)
         ucr_data = read_json(actual_run / "ucr.json")
         program_hash = ucr_data.get("hashes", {}).get("program_hash", "")
         decision_path = actual_run / "forge" / "decision.json"

@@ -1,0 +1,8 @@
+{
+  "suite_id": "suite_v8",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/codepatch_pass_01.json"},
+    {"task_file": "examples/tasks/jsonspec_pass_01.json"}
+  ]
+}

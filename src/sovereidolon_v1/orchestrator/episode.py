@@ -26,9 +26,9 @@ from ..jsonspec.program import (
     compute_jsonspec_hash,
 )
 from ..ledger.ledger import Ledger
+from ..proposer_api import BaseProposer, Proposal
 from ..pyfunc.minimize import MinimizedProgram, minimize_pyfunc_failure
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
-from ..proposer_api import BaseProposer, Proposal
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
 from ..utils import (
     canonical_dumps,
@@ -550,7 +550,11 @@ def episode_run(
             )
             synth_cost = 0
         else:
-            if proposer_output.candidate_program is not None:
+            if (
+                proposer is None
+                and proposer_output
+                and proposer_output.candidate_program is not None
+            ):
                 warm_start_attempted = True
                 program = proposer_output.candidate_program
                 program_hash = proposer_output.candidate_hash
