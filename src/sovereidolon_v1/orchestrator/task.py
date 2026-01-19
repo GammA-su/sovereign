@@ -55,6 +55,10 @@ class Task(BaseModel):
         }
         return stable_hash(payload)
 
+    def io_schema_hash(self) -> str:
+        payload = {"inputs": self.inputs, "output": self.output}
+        return stable_hash(payload)
+
     def has_contradictory_examples(self) -> bool:
         seen: dict[str, Any] = {}
         for example in self.examples:

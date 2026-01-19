@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     controller_overhead_threshold: float = 0.2
     admission_policy: AdmissionPolicy = Field(default_factory=AdmissionPolicy)
     warm_start_store: Optional[str] = None
+    pyfunc_minimize_budget: int = 50
 
     def seed_for(self, run_id: str) -> int:
         digest = stable_hash({"run_id": run_id, "seed": self.open_seed})

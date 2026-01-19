@@ -24,6 +24,7 @@ from ..jsonspec.program import (
     compute_jsonspec_hash,
 )
 from ..ledger.ledger import Ledger
+from ..pyfunc.minimize import MinimizedProgram, minimize_pyfunc_failure
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
 from ..utils import (
@@ -251,6 +252,17 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     warm_start_attempted = False
     warm_start_successful = False
     warm_start_provided = bool(settings.warm_start_store)
+    warm_start_used = False
+    warm_start_mode = "none"
+    warm_start_reason = "NONE"
+    warm_start_fallback_used = False
+    pyfunc_failure_atom = ""
+    pyfunc_failure_lane = ""
+    pyfunc_failure_tier = ""
+    pyfunc_minimized: Optional[MinimizedProgram] = None
+    pyfunc_minimized_path = ""
+    pyfunc_original_hash = ""
+    pyfunc_repro_command = ""
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -309,6 +321,17 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                         warm_start_program = store_candidate
                         warm_start_candidate_hash = store_candidate[1]
                         warm_start_from_store = True
+
+        if warm_start_from_store:
+            if warm_start_program is not None:
+                warm_start_mode = "domain_fallback"
+                warm_start_reason = "DOMAIN_FALLBACK"
+                warm_start_fallback_used = True
+            else:
+                warm_start_mode = "spec_match"
+                warm_start_reason = "SPEC_MATCH"
+        elif warm_start_provided:
+            warm_start_reason = "NO_MATCH"
 
         store_candidates: list[StoreCandidate] = []
         if pyfunc_candidate:
@@ -555,6 +578,45 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             pyexec_pass = any(
                 verdict.tier == "pyexec" and verdict.verdict == "PASS" for verdict in verdicts
             )
+            pyexec_verdict = next(
+                (verdict for verdict in verdicts if verdict.tier == "pyexec"),
+                None,
+            )
+            if (
+                task.task_type == "pyfunc"
+                and pyexec_verdict
+                and pyexec_verdict.verdict == "FAIL"
+                and pyexec_verdict.failure_atoms
+            ):
+                program_path = run_dir / "artifacts" / "pyfunc" / "program.py"
+                if program_path.exists():
+                    entrypoint = task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
+                    tests_payload = [example.model_dump() for example in cegis_result.tests]
+                    pyfunc_failure_atom = pyexec_verdict.failure_atoms[0]
+                    pyfunc_failure_lane = pyexec_verdict.domain
+                    pyfunc_failure_tier = pyexec_verdict.tier
+                    code = program_path.read_text(encoding="utf-8")
+                    pyfunc_original_hash = compute_pyfunc_hash(code)
+                    pyfunc_minimized = minimize_pyfunc_failure(
+                        code=code,
+                        entrypoint=entrypoint,
+                        tests=tests_payload,
+                        failure_atom=pyfunc_failure_atom,
+                        budget=settings.pyfunc_minimize_budget,
+                    )
+                    minimized_path = (
+                        run_dir
+                        / "artifacts"
+                        / "pyfunc"
+                        / f"minimized_{pyfunc_minimized.program_hash}.py"
+                    )
+                    ensure_dir(minimized_path.parent)
+                    minimized_path.write_text(pyfunc_minimized.code, encoding="utf-8")
+                    pyfunc_minimized_path = str(minimized_path)
+                    pyfunc_repro_command = (
+                        "python -I -m sovereidolon_v1.pyfunc.runner "
+                        f"--program {pyfunc_minimized_path} --entrypoint {entrypoint}"
+                    )
             breaker_lab = BreakerLab(settings, run_dir)
             breaker_start = time.time_ns()
             breaker_result = breaker_lab.run(
@@ -639,6 +701,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     warm_start_successful = True
                 else:
                     warm_start_candidate_rejected = True
+            warm_start_used = warm_start_successful
 
             if not witness_id:
                 witness_id = stable_hash(
@@ -804,7 +867,14 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         },
         bg_context=context_data,
         active_view_hash=active_view_hash,
-        run_metadata={"policy_version": settings.policy_version},
+        run_metadata={
+            "policy_version": settings.policy_version,
+            "warm_start_provided": warm_start_provided,
+            "warm_start_used": warm_start_used,
+            "warm_start_mode": warm_start_mode,
+            "warm_start_reason": warm_start_reason,
+            "warm_start_fallback_used": warm_start_fallback_used,
+        },
     )
     ucr_path = run_dir / "ucr.json"
     write_json(ucr_path, ucr.model_dump())
@@ -838,6 +908,18 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         counterexample_hash = (
             stable_hash(breaker_counterexample) if breaker_counterexample is not None else ""
         )
+        pyfunc_minimization = None
+        if pyfunc_minimized is not None:
+            pyfunc_minimization = {
+                "original_program_hash": pyfunc_original_hash,
+                "minimized_program_hash": pyfunc_minimized.program_hash,
+                "failure_atom": pyfunc_failure_atom,
+                "verifier_lane": pyfunc_failure_lane,
+                "verifier_tier": pyfunc_failure_tier,
+                "reproduction_command": pyfunc_repro_command,
+                "minimized_program_path": pyfunc_minimized_path,
+                "minimize_attempts": pyfunc_minimized.attempts,
+            }
         capsule = {
             "task_id": task_id,
             "run_id": run_dir.name,
@@ -853,6 +935,7 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
             else [],
             "counterexample": breaker_counterexample,
             "counterexample_hash": counterexample_hash,
+            "pyfunc_minimization": pyfunc_minimization,
             "breaker_kpi": breaker_kpi,
             "verifier_summary": verifier_summary,
             "program_hash": cegis_result.ast_hash if cegis_result else "",

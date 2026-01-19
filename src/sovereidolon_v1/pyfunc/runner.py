@@ -9,6 +9,8 @@ from typing import Any
 
 from .program import ALLOWED_BUILTINS, PyFuncValidationError, validate_pyfunc_code
 
+PYEXEC_VERSION = "v1"
+
 SAFE_BUILTINS = {
     name: getattr(builtins, name)
     for name in ALLOWED_BUILTINS

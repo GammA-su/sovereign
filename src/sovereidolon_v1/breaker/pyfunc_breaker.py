@@ -169,6 +169,29 @@ def _random_candidate(task: Task, rng: random.Random) -> Dict[str, Any]:
     return candidate
 
 
+def _withheld_candidate(
+    task: Task, family: str, spec: TaskSpec, base: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    keys = sorted(task.inputs.keys())
+    if family in {"commutative", "reverse_args"}:
+        if len(keys) < 2:
+            return None
+        swapped = dict(base)
+        first, second = keys[0], keys[1]
+        swapped[first], swapped[second] = base.get(second), base.get(first)
+        return swapped
+    if family == "idempotent":
+        if len(keys) != 1:
+            return None
+        key = keys[0]
+        expected = spec.evaluate({key: base.get(key)})
+        if isinstance(expected, int) and task.inputs.get(key) == "Int":
+            low, high = _int_bounds(task, key)
+            expected = max(low, min(high, int(expected)))
+        return {key: expected}
+    return None
+
+
 @dataclass
 class BreakerBudget:
     attempt_budget: int
@@ -315,14 +338,17 @@ def run_pyfunc_breaker(
     commutative = bool(pyfunc_meta.get("commutative")) or (
         "commutative" in pyfunc_meta.get("metamorphic", [])
     )
+    withheld_families = list(task.sealed.withheld_families) if task.sealed else []
     attempts = 0
     counterexamples: List[Dict[str, Any]] = []
     found_failure_atoms: List[str] = []
     seen = set()
     max_attempts = max(0, budget.attempt_budget)
+    withheld_trials = 0
+    withheld_hits = 0
 
-    def _try_candidate(candidate: Dict[str, Any]) -> bool:
-        nonlocal attempts
+    def _try_candidate(candidate: Dict[str, Any], withheld: bool = False) -> bool:
+        nonlocal attempts, withheld_trials, withheld_hits
         fingerprint = stable_hash(candidate)
         if attempts >= max_attempts:
             return True
@@ -330,14 +356,29 @@ def run_pyfunc_breaker(
         if fingerprint in seen:
             return attempts >= max_attempts
         seen.add(fingerprint)
+        if withheld:
+            withheld_trials += 1
         is_cex, expected, got, failure_atoms = _evaluate_candidate(
             candidate, spec, program_path, entrypoint
         )
         if is_cex:
+            if withheld:
+                withheld_hits += 1
             counterexamples.append({"inputs": candidate, "expected": expected, "got": got})
             found_failure_atoms.extend(failure_atoms)
             return True
         return False
+
+    base_inputs = [example.inputs for example in task.examples]
+    for idx, family in enumerate(withheld_families):
+        if attempts >= max_attempts:
+            break
+        base = base_inputs[idx % len(base_inputs)] if base_inputs else {}
+        candidate = _withheld_candidate(task, family, spec, base)
+        if candidate is None:
+            continue
+        if _try_candidate(candidate, withheld=True):
+            break
 
     boundary_candidates = _candidate_cartesian(task)
     for candidate in boundary_candidates:
@@ -360,11 +401,12 @@ def run_pyfunc_breaker(
             break
 
     tmr = float(attempts if counterexamples else budget.attempt_budget)
+    wfhr = withheld_hits / max(1, withheld_trials) if withheld_trials else 0.0
     kpi = BreakerKPI(
         CDR=(1.0 / max(1, attempts)) if counterexamples else 0.0,
         TMR=tmr,
         NOVN=1.0 if counterexamples else 0.0,
-        WFHR=0.0,
+        WFHR=wfhr,
         window={"attempts": attempts},
         budget={"attempt_budget": budget.attempt_budget},
     )
@@ -385,6 +427,8 @@ def run_pyfunc_breaker(
         "attempts": attempts,
         "program_hash": program_hash,
         "minimized_steps": minimized_steps,
+        "withheld_trials": withheld_trials,
+        "withheld_hits": withheld_hits,
     }
     return BreakerResult(
         counterexample=Example(

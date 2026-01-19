@@ -15,7 +15,9 @@ from .config import Settings
 from .ledger.ledger import Ledger
 from .orchestrator.episode import episode_run
 from .orchestrator.task import load_task
+from .pyfunc.runner import PYEXEC_VERSION
 from .schemas import UCR, export_schemas
+from .store.audit import audit_store
 from .utils import canonical_dumps, ensure_dir, hash_bytes, read_json, read_jsonl, write_json
 
 app = typer.Typer(help="SOVEREIDOLON v1 CLI")
@@ -408,39 +410,9 @@ def run_migrate_cmd(
 def store_audit_cmd(
     store_dir: Path = STORE_DIR_OPTION
 ) -> None:
-    manifest_path = store_dir / "manifest.json"
-    if not manifest_path.exists():
-        console.print({"ok": False, "errors": ["manifest_missing"], "checks": {}})
-        raise typer.Exit(code=1)
-    manifest = read_json(manifest_path)
-    programs = manifest.get("programs", {})
-    errors: list[str] = []
-    for program_hash, entry in programs.items():
-        domain = entry.get("domain", "")
-        if domain == "pyfunc":
-            ext = ".py"
-        elif domain == "codepatch":
-            ext = ".patch"
-        else:
-            ext = ".json"
-        default_path = store_dir / domain / f"{program_hash}{ext}"
-        entry_path = Path(entry.get("store_path", default_path))
-        if not entry_path.exists():
-            errors.append(f"missing:{program_hash}")
-            continue
-        data = entry_path.read_bytes()
-        computed = hash_bytes(data)
-        if computed != program_hash:
-            errors.append(
-                f"hash_mismatch:{program_hash}:computed={computed}"
-            )
-        if entry.get("store_path"):
-            if Path(entry["store_path"]).resolve() != entry_path.resolve():
-                errors.append(f"path_mismatch:{program_hash}")
-    ok = not errors
-    report = {"ok": ok, "checks": {"manifest_consistency": ok}, "errors": errors}
+    report = audit_store(store_dir)
     console.print(report)
-    if not ok:
+    if not report.get("ok"):
         raise typer.Exit(code=1)
 
 
@@ -500,7 +472,9 @@ def suite_run_cmd(
     if manifest_path.exists():
         manifest = read_json(manifest_path)
     else:
-        manifest = {"schema_version": "v1", "programs": {}}
+        manifest = {"schema_version": "v2", "programs": {}}
+    if manifest.get("schema_version") != "v2":
+        manifest["schema_version"] = "v2"
     programs: dict[str, dict[str, Any]] = manifest.setdefault("programs", {})
 
     totals = {"pass": 0, "fail": 0, "audit_failures": 0, "verify_ns": 0, "breaker_attempts": 0}
@@ -575,6 +549,7 @@ def suite_run_cmd(
         if decision_data.get("decision") == "ADMIT" and program_hash:
             program_entry = programs.get(program_hash)
             manifest_spec = task.spec_signature()
+            io_schema_hash = task.io_schema_hash()
             if task.task_type == "pyfunc":
                 ext = ".py"
             elif task.task_type == "codepatch":
@@ -627,9 +602,15 @@ def suite_run_cmd(
             ensure_dir(store_path.parent)
             store_path.write_bytes(program_bytes)
             if not program_entry:
+                pyexec_version = PYEXEC_VERSION if task.task_type == "pyfunc" else ""
                 program_entry = {
                     "program_hash": program_hash,
                     "domain": task.task_type,
+                    "spec_signature": manifest_spec,
+                    "io_schema_hash": io_schema_hash,
+                    "admitted_by_task": summary["task_id"],
+                    "admit_count": 1,
+                    "pyexec_version": pyexec_version,
                     "first_admitted_by_task": summary["task_id"],
                     "admitted_count": 1,
                     "last_seen_suite": suite_id,
@@ -638,7 +619,6 @@ def suite_run_cmd(
                         if decision_data.get("witness_id")
                         else []
                     ),
-                    "spec_signature": manifest_spec,
                     "store_path": str(store_path),
                 }
                 programs[program_hash] = program_entry
@@ -646,7 +626,15 @@ def suite_run_cmd(
                     {"program_hash": program_hash, "store_path": str(store_path)}
                 )
             else:
-                program_entry["admitted_count"] = program_entry.get("admitted_count", 0) + 1
+                admit_count = program_entry.get(
+                    "admit_count", program_entry.get("admitted_count", 0)
+                )
+                program_entry["admit_count"] = admit_count + 1
+                program_entry["admitted_count"] = program_entry["admit_count"]
+                program_entry["spec_signature"] = manifest_spec
+                program_entry["io_schema_hash"] = io_schema_hash
+                if task.task_type == "pyfunc":
+                    program_entry["pyexec_version"] = PYEXEC_VERSION
                 program_entry["last_seen_suite"] = suite_id
                 witness_id = decision_data.get("witness_id")
                 if witness_id:

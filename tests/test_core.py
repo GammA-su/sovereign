@@ -840,7 +840,7 @@ def test_suite_run_reports(tmp_path: Path) -> None:
     programs = manifest.get("programs", {})
     assert programs
     assert len(report["store_updates"]) == len(programs)
-    assert any(entry.get("admitted_count", 0) > 1 for entry in programs.values())
+    assert any(entry.get("admit_count", 0) > 1 for entry in programs.values())
 
 
 def test_suite_report_norm_written(tmp_path: Path) -> None:
@@ -981,6 +981,14 @@ def test_domain_warm_start_reuse(tmp_path: Path) -> None:
     assert summary["synth_ns"] == 0
     assert summary["warm_start_candidate_hash"] == arith_hash
     assert not summary["warm_start_candidate_rejected"]
+    actual_run = run_dir.parent / summary["run_id"]
+    ucr = read_json(actual_run / "ucr.json")
+    meta = ucr.get("run_metadata", {})
+    assert meta.get("warm_start_mode") == "domain_fallback"
+    assert meta.get("warm_start_reason") == "DOMAIN_FALLBACK"
+    assert meta.get("warm_start_provided") is True
+    assert meta.get("warm_start_used") is True
+    assert meta.get("warm_start_fallback_used") is True
 
 
 def test_store_audit_cmd(tmp_path: Path) -> None:
