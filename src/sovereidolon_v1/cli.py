@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -15,6 +17,7 @@ from .config import Settings
 from .ledger.ledger import Ledger
 from .orchestrator.episode import episode_run
 from .orchestrator.task import load_task
+from .proposer_api import BaseProposer, ReplayProposer, StaticProposer, SubprocessProposer
 from .pyfunc.runner import PYEXEC_VERSION
 from .schemas import UCR, export_schemas
 from .store.audit import audit_store
@@ -40,6 +43,13 @@ SUITE_WARM_START_OPTION = typer.Option(None, "--warm-start-store", exists=True, 
 SUITE_FILE_OPTION = typer.Option(..., "--suite-file", exists=True)
 OUT_DIR_OPTION = typer.Option(..., "--out-dir")
 STORE_DIR_OPTION = typer.Option(..., "--store", exists=True, file_okay=False)
+DOCTOR_REPO_ROOT_OPTION = typer.Option(None, "--repo-root")
+DOCTOR_JSON_OPTION = typer.Option(False, "--json")
+DOCTOR_SMOKE_OPTION = typer.Option(False, "--smoke")
+PROPOSER_OPTION = typer.Option("stub", "--proposer")
+STATIC_PROGRAM_OPTION = typer.Option(None, "--static-program")
+REPLAY_FILE_OPTION = typer.Option(None, "--replay-file")
+CMD_OPTION = typer.Option(None, "--cmd")
 
 
 episode_app = typer.Typer(help="Episode commands")
@@ -64,6 +74,37 @@ def _load_settings(config: Optional[Path]) -> Settings:
     return Settings(**data)
 
 
+def _load_static_program(value: str) -> str:
+    path = Path(value)
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return value
+
+
+def _build_proposer(
+    proposer_kind: str,
+    static_program: Optional[str],
+    replay_file: Optional[Path],
+    cmd: Optional[List[str]],
+) -> Optional[BaseProposer]:
+    if proposer_kind in {"stub", "default"}:
+        return None
+    if proposer_kind == "static":
+        if not static_program:
+            raise typer.BadParameter("missing --static-program for static proposer")
+        program_text = _load_static_program(static_program)
+        return StaticProposer(program_text)
+    if proposer_kind == "replay":
+        if replay_file is None:
+            raise typer.BadParameter("missing --replay-file for replay proposer")
+        return ReplayProposer(replay_file)
+    if proposer_kind == "subprocess":
+        if not cmd:
+            raise typer.BadParameter("missing --cmd for subprocess proposer")
+        return SubprocessProposer(cmd)
+    raise typer.BadParameter(f"unknown proposer: {proposer_kind}")
+
+
 def _ensure_task_file(task_path: Path) -> None:
     if task_path.exists():
         return
@@ -83,6 +124,13 @@ def _ensure_task_file(task_path: Path) -> None:
         write_json(task_path, payload)
 
 
+def _find_repo_root(start: Path) -> Path:
+    for parent in [start] + list(start.parents):
+        if (parent / "pyproject.toml").exists():
+            return parent
+    return start
+
+
 @episode_app.command("run")
 def episode_run_cmd(
     task_file: Path = TASK_FILE_OPTION,
@@ -90,6 +138,10 @@ def episode_run_cmd(
     run_id: Optional[str] = RUN_ID_OPTION,
     config: Optional[Path] = CONFIG_OPTION,
     warm_start_store: Optional[Path] = WARM_START_OPTION,
+    proposer_kind: str = PROPOSER_OPTION,
+    static_program: Optional[str] = STATIC_PROGRAM_OPTION,
+    replay_file: Optional[Path] = REPLAY_FILE_OPTION,
+    cmd: Optional[List[str]] = CMD_OPTION,
 ) -> None:
     settings = _load_settings(config)
     if warm_start_store:
@@ -99,7 +151,13 @@ def episode_run_cmd(
         ensure_dir(run_root)
         run_name = run_id or f"run_{task_file.stem}"
         run_dir = run_root / run_name
-    summary = episode_run(task_file=task_file, run_dir=run_dir, settings=settings)
+    proposer = _build_proposer(proposer_kind, static_program, replay_file, cmd)
+    summary = episode_run(
+        task_file=task_file,
+        run_dir=run_dir,
+        settings=settings,
+        proposer=proposer,
+    )
     table = Table(title="Episode Summary")
     table.add_column("Field")
     table.add_column("Value")
@@ -413,6 +471,177 @@ def store_audit_cmd(
     report = audit_store(store_dir)
     console.print(report)
     if not report.get("ok"):
+        raise typer.Exit(code=1)
+
+
+@app.command("doctor")
+def doctor_cmd(
+    repo_root: Optional[Path] = DOCTOR_REPO_ROOT_OPTION,
+    json_output: bool = DOCTOR_JSON_OPTION,
+    smoke: bool = DOCTOR_SMOKE_OPTION,
+) -> None:
+    root = repo_root or _find_repo_root(Path(__file__).resolve())
+    root = root.resolve()
+    missing: list[str] = []
+    warnings: list[str] = []
+    checks: dict[str, bool] = {}
+
+    def relpath(path: Path) -> str:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            return str(path)
+
+    def check_json(path: Path, label: str, require_newline: bool = False) -> bool:
+        ok = True
+        if not path.exists():
+            missing.append(f"missing_{label}:{relpath(path)}")
+            return False
+        try:
+            read_json(path)
+        except Exception:
+            missing.append(f"bad_json:{relpath(path)}")
+            ok = False
+        if require_newline:
+            data = path.read_bytes()
+            if not data.endswith(b"\n"):
+                missing.append(f"missing_newline:{relpath(path)}")
+                ok = False
+        return ok
+
+    # Store audit import works.
+    store_audit_ok = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store_dir = Path(tmp_dir) / "store"
+            ensure_dir(store_dir / "pyfunc")
+            program_bytes = b"def solve(x):\n    return x\n"
+            program_hash = hash_bytes(program_bytes)
+            program_path = store_dir / "pyfunc" / f"{program_hash}.py"
+            program_path.write_bytes(program_bytes)
+            manifest = {
+                "schema_version": "v2",
+                "programs": {program_hash: {"store_path": str(program_path)}},
+            }
+            write_json(store_dir / "manifest.json", manifest)
+            report = audit_store(store_dir)
+            store_audit_ok = bool(report.get("ok"))
+    except Exception:
+        store_audit_ok = False
+    if not store_audit_ok:
+        missing.append("store_audit_failed")
+    checks["store_audit"] = store_audit_ok
+
+    # Scripts existence and executability.
+    scripts = [
+        "scripts/ci_all.sh",
+        "scripts/ci_golden_suite.sh",
+        "scripts/ci_golden_suite_v2.sh",
+        "scripts/ci_golden_suite_v3.sh",
+        "scripts/ci_golden_suite_v3_warm.sh",
+        "scripts/ci_golden_suite_v4.sh",
+        "scripts/ci_golden_suite_v5.sh",
+        "scripts/ci_golden_suite_v6.sh",
+        "scripts/ci_golden_suite_v6_warm.sh",
+        "scripts/ci_golden_suite_v7.sh",
+        "scripts/ci_sealed.sh",
+    ]
+    scripts_ok = True
+    for script in scripts:
+        path = root / script
+        if not path.exists():
+            missing.append(f"missing_script:{script}")
+            scripts_ok = False
+            continue
+        if not os.access(path, os.X_OK):
+            missing.append(f"script_not_executable:{script}")
+            scripts_ok = False
+    checks["scripts"] = scripts_ok
+
+    # Suites and baselines.
+    suites_ok = True
+    baselines_ok = True
+    for version in range(1, 8):
+        suite_path = root / "examples" / "suites" / f"suite_v{version}.json"
+        if not check_json(suite_path, "suite"):
+            suites_ok = False
+        baseline_path = (
+            root / "examples" / "baselines" / f"suite_v{version}.report.norm.json"
+        )
+        if not check_json(baseline_path, "baseline", require_newline=True):
+            baselines_ok = False
+    checks["suites"] = suites_ok
+    checks["baselines"] = baselines_ok
+    checks["baseline_newlines"] = baselines_ok
+
+    sealed_seed = root / "examples" / "sealed" / "sealed_v1.json"
+    sealed_seed_alt = root / "examples" / "sealed_v1.json"
+    sealed_ok = sealed_seed.exists() or sealed_seed_alt.exists()
+    if not sealed_ok:
+        missing.append("missing_sealed_seed")
+    checks["sealed_seed"] = sealed_ok
+
+    # ci_all references expected scripts.
+    ci_all_path = root / "scripts" / "ci_all.sh"
+    ci_all_refs_ok = True
+    if ci_all_path.exists():
+        content = ci_all_path.read_text(encoding="utf-8")
+        for script in scripts[1:]:
+            script_name = Path(script).name
+            if script_name not in content:
+                missing.append(f"ci_all_missing_ref:{script}")
+                ci_all_refs_ok = False
+    else:
+        ci_all_refs_ok = False
+    checks["ci_all_refs"] = ci_all_refs_ok
+
+    smoke_ok = True
+    if smoke:
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                suite_file = Path(tmp_dir) / "suite.json"
+                suite_payload = {
+                    "suite_id": "doctor_smoke",
+                    "tasks": [
+                        {
+                            "task_file": str(
+                                root / "examples" / "tasks" / "arith_01.json"
+                            )
+                        }
+                    ],
+                }
+                write_json(suite_file, suite_payload)
+                suite_run_cmd(
+                    suite_file=suite_file,
+                    out_dir=Path(tmp_dir) / "out",
+                    policy_version="v1",
+                    warm_start_store=None,
+                )
+        except Exception:
+            smoke_ok = False
+            missing.append("smoke_failed")
+    checks["smoke"] = smoke_ok
+
+    ok = not missing
+    if json_output:
+        payload = {
+            "ok": ok,
+            "missing": missing,
+            "warnings": warnings,
+            "checks": checks,
+        }
+        print(canonical_dumps(payload).decode("utf-8"))
+    else:
+        for name in sorted(checks.keys()):
+            status = "PASS" if checks[name] else "FAIL"
+            print(f"{status} {name}")
+        if missing:
+            print("SUMMARY FAIL")
+            for item in missing:
+                print(f"missing: {item}")
+        else:
+            print("SUMMARY OK")
+    if not ok:
         raise typer.Exit(code=1)
 
 

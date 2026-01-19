@@ -5,6 +5,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+import orjson
+
 from ..artifact_store import ArtifactStore
 from ..bg.bg_engine import BGEngine, compute_context_hash
 from ..breaker.breaker import BreakerLab
@@ -26,6 +28,7 @@ from ..jsonspec.program import (
 from ..ledger.ledger import Ledger
 from ..pyfunc.minimize import MinimizedProgram, minimize_pyfunc_failure
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
+from ..proposer_api import BaseProposer, Proposal
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
 from ..utils import (
     canonical_dumps,
@@ -39,13 +42,30 @@ from ..utils import (
 from ..verify.lanes import VerifierContext
 from ..verify.verifier import required_lanes_passed, run_verifiers
 from .kernel import KernelStub
-from .proposer import ProposerBudget, ProposerInput, ProposerStub, StoreCandidate
+from .proposer import ProposerBudget, ProposerInput, ProposerOutput, ProposerStub, StoreCandidate
 from .specs import task_spec
 from .task import Task, load_task
 
 
 class ContradictoryExamplesError(RuntimeError):
     pass
+
+
+class ProposerFailure(RuntimeError):
+    pass
+
+
+def _proposal_from_stub(output: ProposerOutput) -> Proposal:
+    candidate_program = ""
+    program = output.candidate_program
+    if isinstance(program, PyFuncProgram):
+        candidate_program = program.code
+    elif isinstance(program, CodePatchProgram):
+        candidate_program = program.patch
+    elif isinstance(program, JsonSpecProgram):
+        candidate_program = canonical_dumps(program.spec).decode("utf-8")
+    metadata = output.report()
+    return Proposal.build(candidate_program, "stub", metadata=metadata)
 
 
 def _init_run_dirs(run_dir: Path) -> None:
@@ -215,7 +235,12 @@ def _pyfunc_breaker_verdict(
     )
 
 
-def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str, Any]:
+def episode_run(
+    task_file: Path,
+    run_dir: Path,
+    settings: Settings,
+    proposer: Optional[BaseProposer] = None,
+) -> Dict[str, Any]:
     run_dir = _select_run_dir(run_dir)
     _init_run_dirs(run_dir)
     ledger = Ledger(run_dir / "ledger.jsonl")
@@ -263,6 +288,9 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
     pyfunc_minimized_path = ""
     pyfunc_original_hash = ""
     pyfunc_repro_command = ""
+    proposer_record: Dict[str, Any] = {}
+    deferred_forge_decision: Dict[str, Any] | None = None
+    external_jsonspec_spec: Dict[str, Any] | None = None
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -371,23 +399,65 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 )
             )
 
-        proposer = ProposerStub()
-        proposer_input = ProposerInput(
-            task=task,
-            spec_signature=spec_signature,
-            store_candidates=store_candidates,
-            budget=ProposerBudget(
-                break_budget_attempts=settings.break_budget_attempts,
-                verify_budget_steps=settings.verify_budget_steps,
-            ),
-        )
-        proposer_output = proposer.propose(proposer_input)
-        artifacts.append(
-            artifact_store.write_json(
-                "reports/proposer.json", proposer_output.report(), "proposer_report"
+        proposer_output: ProposerOutput | None = None
+        if proposer is None:
+            proposer_stub = ProposerStub()
+            proposer_input = ProposerInput(
+                task=task,
+                spec_signature=spec_signature,
+                store_candidates=store_candidates,
+                budget=ProposerBudget(
+                    break_budget_attempts=settings.break_budget_attempts,
+                    verify_budget_steps=settings.verify_budget_steps,
+                ),
             )
+            proposer_output = proposer_stub.propose(proposer_input)
+            proposal = _proposal_from_stub(proposer_output)
+        else:
+            proposal = proposer.propose(
+                task,
+                domain=task.task_type,
+                spec_signature=spec_signature,
+                seed=settings.seed_for(run_dir.name),
+                max_tokens=None,
+            )
+
+        if proposer is not None and not proposal.error_atom:
+            if not proposal.candidate_program:
+                proposal = proposal.with_error("PROPOSER_ERROR:missing_candidate")
+            elif task.task_type == "jsonspec":
+                try:
+                    parsed = orjson.loads(proposal.candidate_program)
+                except orjson.JSONDecodeError:
+                    proposal = proposal.with_error("PROPOSER_ERROR:invalid_candidate")
+                else:
+                    if not isinstance(parsed, dict):
+                        proposal = proposal.with_error("PROPOSER_ERROR:invalid_candidate")
+                    else:
+                        external_jsonspec_spec = parsed
+
+        proposer_record = proposal.to_record()
+        proposer_record.update(
+            {
+                "task_id": task.task_id,
+                "spec_signature": spec_signature,
+                "domain": task.task_type,
+            }
         )
-        ledger.append("PROPOSER_RESULT", proposer_output.report())
+        proposer_path = run_dir / "proposer.json"
+        write_json(proposer_path, proposer_record)
+        ledger.append("PROPOSER_RESULT", proposer_record)
+
+        if proposal.error_atom:
+            failure_reason = "PROPOSER_FAILED"
+            overall_verdict = "FAIL"
+            verdicts = [_synth_failure_verdict(task, proposal.error_atom)]
+            deferred_forge_decision = {
+                "decision": "REJECT",
+                "reason": "proposer_failed",
+                "program_hash": "",
+            }
+            raise ProposerFailure(proposal.error_atom)
 
         rng_seed = settings.seed_for(run_dir.name)
         tests = list(task.examples)
@@ -396,16 +466,21 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         if is_pyfunc:
             code_program: PyFuncProgram
             code_hash: str
-            candidate_program = proposer_output.candidate_program
-            if candidate_program is None or not isinstance(candidate_program, PyFuncProgram):
-                candidate_code = pyfunc_meta.get("candidate_program", "")
-                if not candidate_code:
-                    raise RuntimeError("missing pyfunc candidate program")
-                candidate_program = PyFuncProgram(candidate_code)
-            code_program = candidate_program
-            code_hash = proposer_output.candidate_hash or compute_pyfunc_hash(
-                candidate_program.code
-            )
+            if proposer is None:
+                candidate_program = (
+                    proposer_output.candidate_program if proposer_output else None
+                )
+                if candidate_program is None or not isinstance(candidate_program, PyFuncProgram):
+                    candidate_code = pyfunc_meta.get("candidate_program", "")
+                    if not candidate_code:
+                        raise RuntimeError("missing pyfunc candidate program")
+                    candidate_program = PyFuncProgram(candidate_code)
+                code_program = candidate_program
+                proposer_hash = proposer_output.candidate_hash if proposer_output else ""
+                code_hash = proposer_hash or compute_pyfunc_hash(candidate_program.code)
+            else:
+                code_program = PyFuncProgram(proposal.candidate_program)
+                code_hash = compute_pyfunc_hash(code_program.code)
             cegis_result = CEGISResult(
                 status="ok",
                 program=code_program,
@@ -419,16 +494,21 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         elif is_codepatch:
             patch_program: CodePatchProgram
             patch_hash: str
-            candidate_program = proposer_output.candidate_program
-            if candidate_program is None or not isinstance(candidate_program, CodePatchProgram):
-                candidate_patch = codepatch_meta.get("candidate_patch", "")
-                if not candidate_patch:
-                    raise RuntimeError("missing codepatch candidate patch")
-                candidate_program = CodePatchProgram(candidate_patch)
-            patch_program = candidate_program
-            patch_hash = proposer_output.candidate_hash or compute_codepatch_hash(
-                candidate_program.patch
-            )
+            if proposer is None:
+                candidate_program = (
+                    proposer_output.candidate_program if proposer_output else None
+                )
+                if candidate_program is None or not isinstance(candidate_program, CodePatchProgram):
+                    candidate_patch = codepatch_meta.get("candidate_patch", "")
+                    if not candidate_patch:
+                        raise RuntimeError("missing codepatch candidate patch")
+                    candidate_program = CodePatchProgram(candidate_patch)
+                patch_program = candidate_program
+                proposer_hash = proposer_output.candidate_hash if proposer_output else ""
+                patch_hash = proposer_hash or compute_codepatch_hash(candidate_program.patch)
+            else:
+                patch_program = CodePatchProgram(proposal.candidate_program)
+                patch_hash = compute_codepatch_hash(patch_program.patch)
             cegis_result = CEGISResult(
                 status="ok",
                 program=patch_program,
@@ -442,16 +522,23 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
         elif is_jsonspec:
             json_program: JsonSpecProgram
             json_hash: str
-            candidate_program = proposer_output.candidate_program
-            if candidate_program is None or not isinstance(candidate_program, JsonSpecProgram):
-                candidate_spec = jsonspec_meta.get("candidate_program")
-                if not candidate_spec:
+            if proposer is None:
+                candidate_program = (
+                    proposer_output.candidate_program if proposer_output else None
+                )
+                if candidate_program is None or not isinstance(candidate_program, JsonSpecProgram):
+                    candidate_spec = jsonspec_meta.get("candidate_program")
+                    if not candidate_spec:
+                        raise RuntimeError("missing jsonspec candidate program")
+                    candidate_program = JsonSpecProgram(candidate_spec)
+                json_program = candidate_program
+                proposer_hash = proposer_output.candidate_hash if proposer_output else ""
+                json_hash = proposer_hash or compute_jsonspec_hash(candidate_program.spec)
+            else:
+                if external_jsonspec_spec is None:
                     raise RuntimeError("missing jsonspec candidate program")
-                candidate_program = JsonSpecProgram(candidate_spec)
-            json_program = candidate_program
-            json_hash = proposer_output.candidate_hash or compute_jsonspec_hash(
-                candidate_program.spec
-            )
+                json_program = JsonSpecProgram(external_jsonspec_spec)
+                json_hash = compute_jsonspec_hash(json_program.spec)
             cegis_result = CEGISResult(
                 status="ok",
                 program=json_program,
@@ -780,6 +867,8 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                     {"reason": decision.reason, "witness_id": witness_id},
                 )
 
+    except ProposerFailure:
+        pass
     except Exception:  # noqa: BLE001
         if not failure_reason:
             failure_reason = "EXCEPTION"
@@ -806,6 +895,22 @@ def episode_run(task_file: Path, run_dir: Path, settings: Settings) -> Dict[str,
                 "failure_reason": failure_reason,
                 "program_hash": cegis_result.ast_hash if cegis_result else "",
             }
+        )
+
+    if deferred_forge_decision is not None:
+        deferred_forge_decision["witness_id"] = witness_id
+        decision_path = run_dir / "forge" / "decision.json"
+        write_json(decision_path, deferred_forge_decision)
+        ledger.append(
+            "FORGE_DECISION",
+            {
+                "decision": deferred_forge_decision.get("decision"),
+                "reason": deferred_forge_decision.get("reason"),
+            },
+        )
+        ledger.append(
+            "FORGE_REJECT",
+            {"reason": deferred_forge_decision.get("reason"), "witness_id": witness_id},
         )
 
     warm_start = warm_start_successful
