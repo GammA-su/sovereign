@@ -310,8 +310,11 @@ def run_pyfunc_breaker(
     seed_value = _seed_for(task, program_hash)
     rng = random.Random(seed_value)
     spec = task_spec(task)
-    entrypoint = task.metadata.get("pyfunc", {}).get("entrypoint", "solve")
-    commutative = "commutative" in task.metadata.get("pyfunc", {}).get("metamorphic", [])
+    pyfunc_meta = task.metadata.get("pyfunc", {})
+    entrypoint = pyfunc_meta.get("entrypoint", "solve")
+    commutative = bool(pyfunc_meta.get("commutative")) or (
+        "commutative" in pyfunc_meta.get("metamorphic", [])
+    )
     attempts = 0
     counterexamples: List[Dict[str, Any]] = []
     found_failure_atoms: List[str] = []

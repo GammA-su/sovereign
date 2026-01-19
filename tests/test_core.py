@@ -1403,6 +1403,15 @@ def test_suite_v3_warm_regression(tmp_path: Path) -> None:
     )
     assert result_b.exit_code == 0
 
+    report_b = read_json(out_b / "report.json")
+    entry = next(task for task in report_b["per_task"] if task["task_id"] == "pyfunc_01")
+    assert entry["warm_start_store"]
+    assert entry["warm_start_provided"]
+    assert entry["synth_ns"] == 0
+    candidate_hash = entry["warm_start_candidate_hash"]
+    assert candidate_hash
+    assert candidate_hash == entry["program_hash"]
+
     norm_path = out_b / "report.norm.json"
     assert norm_path.exists()
     norm_text = norm_path.read_text(encoding="utf-8")
