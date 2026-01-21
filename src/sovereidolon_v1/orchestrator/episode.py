@@ -19,6 +19,14 @@ from ..codepatch.program import (
     compute_codepatch_hash,
 )
 from ..config import Settings
+from ..coverage_ledger import CoverageLedger
+from ..dominance_controller import (
+    ControllerVerdict,
+    DominanceController,
+    dominance_v1_policy,
+    dominance_v2_policy,
+    dominance_v3_policy,
+)
 from ..forge.forge import ForgeGate
 from ..jsonspec.program import (
     JSONSPEC_INTERPRETER_HASH,
@@ -26,6 +34,12 @@ from ..jsonspec.program import (
     compute_jsonspec_hash,
 )
 from ..ledger.ledger import Ledger
+from ..promotion_store import (
+    find_spec_mismatch_candidate,
+    get_best_any,
+    get_best_for_tier,
+    promote_artifact,
+)
 from ..proposer_api import BaseProposer, Proposal
 from ..pyfunc.minimize import MinimizedProgram, minimize_pyfunc_failure
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
@@ -94,17 +108,19 @@ def _select_run_dir(run_dir: Path) -> Path:
 
 
 def _load_store_candidate(
-    store_dir: Path, spec_signature: str, domain: str
+    store_dir: Path, spec_hash: str, domain: str
 ) -> tuple[Program, str] | None:
     manifest_path = store_dir / "manifest.json"
     if not manifest_path.exists():
         return None
     manifest = read_json(manifest_path)
     programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
-    domain_candidates: list[tuple[Program, str]] = []
     for program_hash, entry in programs.items():
         entry_domain = entry.get("domain", "")
         if not entry_domain:
+            continue
+        entry_spec = entry.get("spec_hash") or entry.get("spec_signature", "")
+        if entry_spec != spec_hash:
             continue
         program_path = Path(
             entry.get("store_path", store_dir / entry_domain / f"{program_hash}.json")
@@ -113,19 +129,32 @@ def _load_store_candidate(
             continue
         program_data = read_json(program_path)
         program = Program.model_validate(program_data)
-        if entry.get("spec_signature") == spec_signature:
-            return program, program_hash
         if entry_domain == domain:
-            domain_candidates.append((program, program_hash))
-        if domain_candidates:
-            domain_candidates.sort(key=lambda item: item[1])
-            return domain_candidates[0]
+            return program, program_hash
     return None
+
+
+def _find_store_spec_mismatch(store_dir: Path, spec_hash: str, domain: str) -> str:
+    manifest_path = store_dir / "manifest.json"
+    if not manifest_path.exists():
+        return ""
+    manifest = read_json(manifest_path)
+    programs: dict[str, dict[str, Any]] = manifest.get("programs", {})
+    mismatched: list[str] = []
+    for program_hash, entry in programs.items():
+        if entry.get("domain") != domain:
+            continue
+        entry_spec = entry.get("spec_hash") or entry.get("spec_signature", "")
+        if entry_spec and entry_spec != spec_hash:
+            mismatched.append(program_hash)
+    if not mismatched:
+        return ""
+    return sorted(mismatched)[0]
 
 
 def _load_pyfunc_candidate(
     store_dir: Path,
-    spec_signature: str,
+    spec_hash: str,
 ) -> tuple[PyFuncProgram, str] | None:
     manifest_path = store_dir / "manifest.json"
     if not manifest_path.exists():
@@ -135,7 +164,8 @@ def _load_pyfunc_candidate(
     for program_hash, entry in programs.items():
         if entry.get("domain") != "pyfunc":
             continue
-        if entry.get("spec_signature") != spec_signature:
+        entry_spec = entry.get("spec_hash") or entry.get("spec_signature", "")
+        if entry_spec != spec_hash:
             continue
         program_path = Path(entry.get("store_path", store_dir / "pyfunc" / f"{program_hash}.py"))
         if not program_path.exists():
@@ -147,7 +177,7 @@ def _load_pyfunc_candidate(
 
 def _load_codepatch_candidate(
     store_dir: Path,
-    spec_signature: str,
+    spec_hash: str,
 ) -> tuple[CodePatchProgram, str] | None:
     manifest_path = store_dir / "manifest.json"
     if not manifest_path.exists():
@@ -157,7 +187,8 @@ def _load_codepatch_candidate(
     for program_hash, entry in programs.items():
         if entry.get("domain") != "codepatch":
             continue
-        if entry.get("spec_signature") != spec_signature:
+        entry_spec = entry.get("spec_hash") or entry.get("spec_signature", "")
+        if entry_spec != spec_hash:
             continue
         program_path = Path(
             entry.get("store_path", store_dir / "codepatch" / f"{program_hash}.patch")
@@ -171,7 +202,7 @@ def _load_codepatch_candidate(
 
 def _load_jsonspec_candidate(
     store_dir: Path,
-    spec_signature: str,
+    spec_hash: str,
 ) -> tuple[JsonSpecProgram, str] | None:
     manifest_path = store_dir / "manifest.json"
     if not manifest_path.exists():
@@ -181,7 +212,8 @@ def _load_jsonspec_candidate(
     for program_hash, entry in programs.items():
         if entry.get("domain") != "jsonspec":
             continue
-        if entry.get("spec_signature") != spec_signature:
+        entry_spec = entry.get("spec_hash") or entry.get("spec_signature", "")
+        if entry_spec != spec_hash:
             continue
         program_path = Path(
             entry.get("store_path", store_dir / "jsonspec" / f"{program_hash}.json")
@@ -192,6 +224,34 @@ def _load_jsonspec_candidate(
         program = JsonSpecProgram(program_data)
         return program, program_hash
     return None
+
+
+def _load_promotion_candidate(
+    store_dir: Path,
+    domain: str,
+    entry: Dict[str, Any],
+) -> tuple[Any, str] | None:
+    program_hash = str(entry.get("program_hash", ""))
+    artifact_path = entry.get("store_path") or entry.get("artifact_path", "")
+    if not program_hash or not isinstance(artifact_path, str):
+        return None
+    program_path = Path(artifact_path)
+    if not program_path.is_absolute():
+        program_path = store_dir / program_path
+    if not program_path.exists():
+        return None
+    if domain == "pyfunc":
+        code = program_path.read_text(encoding="utf-8")
+        return PyFuncProgram(code), program_hash
+    if domain == "codepatch":
+        patch_text = program_path.read_text(encoding="utf-8")
+        return CodePatchProgram(patch_text), program_hash
+    if domain == "jsonspec":
+        program_data = read_json(program_path)
+        return JsonSpecProgram(program_data), program_hash
+    program_data = read_json(program_path)
+    program = Program.model_validate(program_data)
+    return program, program_hash
 
 
 def _synth_failure_verdict(task: Task, reason: str) -> VerifierVerdict:
@@ -276,7 +336,7 @@ def episode_run(
     warm_start_candidate_rejected = False
     warm_start_attempted = False
     warm_start_successful = False
-    warm_start_provided = bool(settings.warm_start_store)
+    warm_start_provided = bool(settings.warm_start_store or settings.promotion_store)
     warm_start_used = False
     warm_start_mode = "none"
     warm_start_reason = "NONE"
@@ -291,6 +351,23 @@ def episode_run(
     proposer_record: Dict[str, Any] = {}
     deferred_forge_decision: Dict[str, Any] | None = None
     external_jsonspec_spec: Dict[str, Any] | None = None
+    promotion_best_hash_used = ""
+    promotion_best_tier_used = ""
+    controller_decision: ControllerVerdict | None = None
+    coverage_atoms: list[str] = []
+    spec_signature = ""
+    spec_hash = ""
+    warm_start_reject_reason_atoms: list[str] = []
+    promotion_reject_reason_atoms: list[str] = []
+    retrieval_reject_reason_atoms: list[str] = []
+    reuse_source = "none"
+    reuse_attempted = {
+        "warm_start_attempted": False,
+        "promotion_attempted": False,
+        "retrieval_attempted": False,
+    }
+    promotion_best_hash = ""
+    promotion_best_tier = ""
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -307,95 +384,218 @@ def episode_run(
             raise ContradictoryExamplesError("contradictory examples in task")
 
         spec_signature = task.spec_signature()
+        spec_hash = task.spec_hash()
+        reuse_attempted["warm_start_attempted"] = bool(settings.warm_start_store)
+        reuse_attempted["promotion_attempted"] = bool(settings.prefer_promotion_store)
         is_pyfunc = task.task_type == "pyfunc"
         is_codepatch = task.task_type == "codepatch"
         is_jsonspec = task.task_type == "jsonspec"
         pyfunc_meta = task.metadata.get("pyfunc", {})
         codepatch_meta = task.metadata.get("codepatch", {})
         jsonspec_meta = task.metadata.get("jsonspec", {})
+        if is_pyfunc:
+            meta_families = pyfunc_meta.get("metamorphic", [])
+        elif is_codepatch:
+            meta_families = codepatch_meta.get("metamorphic", [])
+        elif is_jsonspec:
+            meta_families = jsonspec_meta.get("metamorphic", [])
+        else:
+            meta_families = []
+        meta_families = [name for name in meta_families if isinstance(name, str)]
+        meta_required = bool(meta_families)
+        if is_pyfunc:
+            lane_id = "pyexec_meta" if meta_required else "pyexec"
+        elif is_codepatch:
+            lane_id = "codepatch_meta" if meta_required else "codepatch_apply"
+        elif is_jsonspec:
+            lane_id = "jsonspec_meta" if meta_required else "jsonspec_exec"
+        else:
+            lane_id = task.task_type
+        families_mode = "sealed" if task.sealed or settings.is_sealed_run else "public"
+        promotion_candidate: tuple[Any, str] | None = None
+        promotion_candidate_hash = ""
+        promotion_candidate_tier = ""
+        promotion_best_entry: Dict[str, Any] | None = None
+        promotion_mismatch_entry: Dict[str, Any] | None = None
+        promotion_tier_fallback = False
+        promotion_tier_not_found = False
+        promotion_store_dir: Path | None = None
+        if settings.promotion_store:
+            promotion_store_dir = Path(settings.promotion_store)
+            preferred_tier = str(settings.prefer_promotion_tier or "sealed").lower()
+            if preferred_tier == "any":
+                promotion_best_entry = get_best_any(
+                    promotion_store_dir,
+                    domain=task.task_type,
+                    spec_hash=spec_hash,
+                )
+            else:
+                promotion_best_entry = get_best_for_tier(
+                    promotion_store_dir,
+                    domain=task.task_type,
+                    spec_hash=spec_hash,
+                    tier=preferred_tier,
+                )
+                if promotion_best_entry is None:
+                    other_tier = "public" if preferred_tier == "sealed" else "sealed"
+                    other_entry = get_best_for_tier(
+                        promotion_store_dir,
+                        domain=task.task_type,
+                        spec_hash=spec_hash,
+                        tier=other_tier,
+                    )
+                    if other_entry is not None:
+                        if settings.promotion_tier_strict:
+                            promotion_tier_not_found = True
+                        else:
+                            promotion_best_entry = other_entry
+                            promotion_tier_fallback = True
+                    else:
+                        promotion_tier_not_found = True
+            promotion_mismatch_entry = find_spec_mismatch_candidate(
+                promotion_store_dir,
+                domain=task.task_type,
+                spec_hash=spec_hash,
+                lane_id=lane_id,
+                families_mode=families_mode,
+                meta_families=meta_families,
+                prefer_tier=settings.prefer_promotion_tier,
+            )
+            if promotion_best_entry:
+                promotion_candidate_tier = str(
+                    promotion_best_entry.get("tier", "public")
+                ).lower()
+                if promotion_candidate_tier not in {"sealed", "public"}:
+                    promotion_candidate_tier = "public"
+                promotion_best_hash = str(
+                    promotion_best_entry.get("program_hash", "")
+                )
+                promotion_best_tier = promotion_candidate_tier
+                promotion_candidate = _load_promotion_candidate(
+                    promotion_store_dir,
+                    task.task_type,
+                    promotion_best_entry,
+                )
+                if promotion_candidate:
+                    promotion_candidate_hash = promotion_candidate[1]
+                else:
+                    promotion_reject_reason_atoms = ["PROMOTION_VALIDATION_FAILED"]
         warm_start_program: tuple[Program, str] | None = None
         warm_start_from_store = False
         pyfunc_candidate: tuple[PyFuncProgram, str] | None = None
         codepatch_candidate: tuple[CodePatchProgram, str] | None = None
         jsonspec_candidate: tuple[JsonSpecProgram, str] | None = None
+        warm_start_mismatch_hash = ""
         if settings.warm_start_store:
             if is_pyfunc:
                 pyfunc_candidate = _load_pyfunc_candidate(
-                    Path(settings.warm_start_store), spec_signature
+                    Path(settings.warm_start_store), spec_hash
                 )
             elif is_codepatch:
                 codepatch_candidate = _load_codepatch_candidate(
-                    Path(settings.warm_start_store), spec_signature
+                    Path(settings.warm_start_store), spec_hash
                 )
             elif is_jsonspec:
                 jsonspec_candidate = _load_jsonspec_candidate(
-                    Path(settings.warm_start_store), spec_signature
+                    Path(settings.warm_start_store), spec_hash
                 )
             if pyfunc_candidate:
                 warm_start_candidate_hash = pyfunc_candidate[1]
-                warm_start_from_store = True
             elif codepatch_candidate:
                 warm_start_candidate_hash = codepatch_candidate[1]
-                warm_start_from_store = True
             elif jsonspec_candidate:
                 warm_start_candidate_hash = jsonspec_candidate[1]
-                warm_start_from_store = True
             else:
                 if not is_jsonspec:
                     store_candidate = _load_store_candidate(
-                        Path(settings.warm_start_store), spec_signature, task.task_type
+                        Path(settings.warm_start_store), spec_hash, task.task_type
                     )
                     if store_candidate:
                         warm_start_program = store_candidate
                         warm_start_candidate_hash = store_candidate[1]
-                        warm_start_from_store = True
+            warm_start_mismatch_hash = _find_store_spec_mismatch(
+                Path(settings.warm_start_store), spec_hash, task.task_type
+            )
 
-        if warm_start_from_store:
-            if warm_start_program is not None:
+        selected_candidate: tuple[Any, str] | None = None
+        selected_source = "none"
+        if promotion_candidate and settings.prefer_promotion_store:
+            selected_candidate = promotion_candidate
+            selected_source = "promotion_store"
+            warm_start_candidate_hash = promotion_candidate_hash
+        elif pyfunc_candidate:
+            selected_candidate = pyfunc_candidate
+            selected_source = "warm_start_store"
+        elif codepatch_candidate:
+            selected_candidate = codepatch_candidate
+            selected_source = "warm_start_store"
+        elif jsonspec_candidate:
+            selected_candidate = jsonspec_candidate
+            selected_source = "warm_start_store"
+        elif warm_start_program:
+            selected_candidate = warm_start_program
+            selected_source = "warm_start_store"
+        elif promotion_candidate:
+            selected_candidate = promotion_candidate
+            selected_source = "promotion_store"
+            warm_start_candidate_hash = promotion_candidate_hash
+
+        if selected_candidate is not None:
+            warm_start_from_store = True
+            if selected_source == "promotion_store":
+                warm_start_mode = "promotion_best"
+                warm_start_reason = "PROMOTION_BEST"
+            elif warm_start_program is not None and selected_source == "warm_start_store":
                 warm_start_mode = "domain_fallback"
                 warm_start_reason = "DOMAIN_FALLBACK"
                 warm_start_fallback_used = True
-            else:
+            elif selected_source == "warm_start_store":
                 warm_start_mode = "spec_match"
                 warm_start_reason = "SPEC_MATCH"
         elif warm_start_provided:
             warm_start_reason = "NO_MATCH"
 
+        if promotion_mismatch_entry and not promotion_best_entry:
+            promotion_reject_reason_atoms = ["PROMOTION_SPEC_MISMATCH"]
+        if promotion_tier_fallback:
+            if "PROMOTION_TIER_FALLBACK" not in promotion_reject_reason_atoms:
+                promotion_reject_reason_atoms.append("PROMOTION_TIER_FALLBACK")
+        if promotion_tier_not_found and settings.promotion_tier_strict:
+            if not promotion_reject_reason_atoms:
+                promotion_reject_reason_atoms = ["PROMOTION_TIER_NOT_FOUND"]
+        if reuse_attempted["promotion_attempted"] and not promotion_best_entry:
+            if not promotion_reject_reason_atoms:
+                promotion_reject_reason_atoms = ["PROMOTION_NOT_FOUND"]
+        if selected_candidate is None:
+            if promotion_mismatch_entry and not promotion_best_entry:
+                warm_start_candidate_rejected = True
+                warm_start_reject_reason_atoms = ["SPEC_MISMATCH"]
+                if not warm_start_candidate_hash:
+                    warm_start_candidate_hash = str(
+                        promotion_mismatch_entry.get("program_hash", "")
+                    )
+            if warm_start_mismatch_hash:
+                warm_start_candidate_rejected = True
+                warm_start_reject_reason_atoms = ["SPEC_MISMATCH"]
+                if not warm_start_candidate_hash:
+                    warm_start_candidate_hash = warm_start_mismatch_hash
+            if reuse_attempted["warm_start_attempted"] and not warm_start_reject_reason_atoms:
+                warm_start_reject_reason_atoms = ["NOT_FOUND"]
+
+        promotion_best_hash_used = ""
+        promotion_best_tier_used = ""
+        if selected_source == "promotion_store" and promotion_candidate_hash:
+            promotion_best_hash_used = promotion_candidate_hash
+            promotion_best_tier_used = promotion_candidate_tier or "public"
+
         store_candidates: list[StoreCandidate] = []
-        if pyfunc_candidate:
+        if selected_candidate is not None:
             store_candidates.append(
                 StoreCandidate(
-                    program=pyfunc_candidate[0],
-                    program_hash=pyfunc_candidate[1],
-                    domain="pyfunc",
-                    source="warm_start_store",
-                )
-            )
-        elif codepatch_candidate:
-            store_candidates.append(
-                StoreCandidate(
-                    program=codepatch_candidate[0],
-                    program_hash=codepatch_candidate[1],
-                    domain="codepatch",
-                    source="warm_start_store",
-                )
-            )
-        elif jsonspec_candidate:
-            store_candidates.append(
-                StoreCandidate(
-                    program=jsonspec_candidate[0],
-                    program_hash=jsonspec_candidate[1],
-                    domain="jsonspec",
-                    source="warm_start_store",
-                )
-            )
-        elif warm_start_program:
-            store_candidates.append(
-                StoreCandidate(
-                    program=warm_start_program[0],
-                    program_hash=warm_start_program[1],
+                    program=selected_candidate[0],
+                    program_hash=selected_candidate[1],
                     domain=task.task_type,
-                    source="warm_start_store",
+                    source=selected_source,
                 )
             )
 
@@ -437,6 +637,10 @@ def episode_run(
                         external_jsonspec_spec = parsed
 
         proposer_record = proposal.to_record()
+        if isinstance(proposal.metadata, dict):
+            for key in ("kind", "dataset_hash", "match_type"):
+                if key in proposal.metadata:
+                    proposer_record[key] = proposal.metadata[key]
         proposer_record.update(
             {
                 "task_id": task.task_id,
@@ -448,6 +652,14 @@ def episode_run(
         write_json(proposer_path, proposer_record)
         ledger.append("PROPOSER_RESULT", proposer_record)
 
+        if isinstance(proposal.metadata, dict) and proposal.metadata.get("kind") == "retrieval":
+            reuse_attempted["retrieval_attempted"] = True
+            match_type = proposal.metadata.get("match_type")
+            if match_type == "none":
+                retrieval_reject_reason_atoms = ["NOT_FOUND"]
+        if proposal.error_atom and reuse_attempted["retrieval_attempted"]:
+            retrieval_reject_reason_atoms = ["VALIDATION_FAIL"]
+
         if proposal.error_atom:
             failure_reason = "PROPOSER_FAILED"
             overall_verdict = "FAIL"
@@ -458,6 +670,18 @@ def episode_run(
                 "program_hash": "",
             }
             raise ProposerFailure(proposal.error_atom)
+
+        if proposer_output is not None and proposer_output.source == "store":
+            if selected_source == "promotion_store":
+                reuse_source = "promotion"
+            elif selected_source == "warm_start_store":
+                reuse_source = "warm_start"
+        elif reuse_attempted["retrieval_attempted"]:
+            if (
+                isinstance(proposal.metadata, dict)
+                and proposal.metadata.get("match_type") == "exact"
+            ):
+                reuse_source = "retrieval"
 
         rng_seed = settings.seed_for(run_dir.name)
         tests = list(task.examples)
@@ -787,6 +1011,97 @@ def episode_run(
                 if not failure_reason:
                     failure_reason = "BREAKER_WITHHELD_FAIL"
 
+            if settings.policy_version == "v3":
+                controller_policy = dominance_v3_policy()
+            elif settings.policy_version == "v2":
+                controller_policy = dominance_v2_policy()
+            else:
+                controller_policy = dominance_v1_policy()
+            controller = DominanceController(controller_policy)
+            sealed_regression = bool(
+                task.sealed and breaker_result.report.get("withheld_hits", 0) > 0
+            )
+            metamorphic_violation = any(
+                atom.startswith("METAMORPHIC_VIOLATION")
+                for verdict in verdicts
+                for atom in verdict.failure_atoms
+            )
+            metamorphic_pass = any(
+                verdict.tier == "metamorphic" and verdict.verdict == "PASS"
+                for verdict in verdicts
+            )
+            breaker_report = breaker_result.report
+            verifier_payload = [verdict.model_dump() for verdict in verdicts]
+            coverage_ledger = CoverageLedger()
+            coverage_gain = coverage_ledger.update_from_episode(
+                ucr={},
+                verifier=verifier_payload,
+                breaker=breaker_report,
+                task=task,
+            )
+            coverage_atoms = sorted(
+                coverage_ledger._episode_atoms(task.task_type, verifier_payload, breaker_report)
+            )
+            controller_context: Dict[str, Any] = {
+                "sealed_regression": sealed_regression,
+                "program_hash": cegis_result.ast_hash,
+                "families_mode": families_mode,
+                "coverage_atoms": coverage_atoms,
+                "metamorphic_violation": metamorphic_violation,
+                "metamorphic_pass": metamorphic_pass,
+                "coverage_gain": coverage_gain,
+                "domain": task.task_type,
+                "spec_signature": spec_signature,
+            }
+            if promotion_best_entry:
+                controller_context["best_score"] = promotion_best_entry.get("score_key")
+                controller_context["best_program_hash"] = promotion_best_entry.get(
+                    "program_hash", ""
+                )
+            deterministic_synth = len(cegis_result.tests) if cegis_result else 0
+            deterministic_verify = 0
+            for verdict in verdicts:
+                if verdict.cost:
+                    for key in ("tests", "samples", "attempts"):
+                        value = verdict.cost.get(key)
+                        if isinstance(value, (int, float)):
+                            deterministic_verify += int(value)
+            deterministic_breaker = int(breaker_report.get("attempts", 0))
+            if settings.policy_version == "v3":
+                controller_costs = {
+                    "breaker_attempts": breaker_attempts,
+                    "meta_cases": meta_cases,
+                    "synth_ns": deterministic_synth,
+                    "verifier_attempts": meta_cases,
+                    "verify_ns": deterministic_verify,
+                    "breaker_ns": deterministic_breaker,
+                }
+            else:
+                controller_costs = {
+                    "breaker_attempts": breaker_attempts,
+                    "meta_cases": meta_cases,
+                    "synth_ns": synth_cost,
+                    "verifier_attempts": meta_cases,
+                    "verify_ns": verify_cost,
+                    "breaker_ns": breaker_cost,
+                }
+            controller_decision = controller.evaluate(
+                task_domain=task.task_type,
+                lane_results={"required_passed": required_pass},
+                breaker_kpi=breaker_kpi,
+                costs=controller_costs,
+                context=controller_context,
+            )
+            controller_path = run_dir / "controller.json"
+            write_json(controller_path, controller_decision.to_record())
+            ledger.append("CONTROLLER_DECISION", controller_decision.to_record())
+            controller_reject = controller_decision.decision != "ADMIT"
+            if controller_reject:
+                required_pass = False
+                overall_verdict = "FAIL"
+                if not failure_reason:
+                    failure_reason = "CONTROLLER_REJECT"
+
             if warm_start_attempted:
                 if required_pass:
                     warm_start_successful = True
@@ -816,6 +1131,8 @@ def episode_run(
                 controller_overhead_ratio,
                 withheld_hits,
             )
+            if controller_reject and decision.decision == "REJECT":
+                decision.reason = "dominance_reject"
             ledger.append(
                 "FORGE_DECISION",
                 {"decision": decision.decision, "reason": decision.reason},
@@ -860,6 +1177,22 @@ def episode_run(
                         "domain": task.task_type,
                     },
                 )
+                if settings.promotion_store:
+                    promotion_store_dir = Path(settings.promotion_store)
+                    promote_artifact(
+                        promotion_store_dir,
+                        domain=task.task_type,
+                        program_hash=cegis_result.ast_hash,
+                        artifact_path=store_path,
+                        spec_hash=spec_hash,
+                        lane_id=lane_id,
+                        families_mode=families_mode,
+                        meta_families=meta_families,
+                        score=controller_decision.score,
+                        score_key=controller_decision.score_key,
+                        score_scaled=controller_decision.score_scaled,
+                        admitted_by_run_id=run_dir.name,
+                    )
             elif decision.decision == "REJECT":
                 ledger.append(
                     "FORGE_REJECT",
@@ -1068,6 +1401,94 @@ def episode_run(
         },
     )
 
+    train_failure_atoms: list[str] = []
+    for verdict in verdicts or []:
+        for atom in verdict.failure_atoms:
+            if atom not in train_failure_atoms:
+                train_failure_atoms.append(atom)
+    if isinstance(breaker_report, dict):
+        for atom in breaker_report.get("failure_atoms", []) or []:
+            if isinstance(atom, str) and atom and atom not in train_failure_atoms:
+                train_failure_atoms.append(atom)
+    train_failure_atoms = sorted(train_failure_atoms)
+    proposer_info = {
+        "name": proposer_record.get("proposer_id", ""),
+        "proposal_hash": proposer_record.get("proposal_hash", ""),
+        "error_atom": proposer_record.get("error_atom", ""),
+    }
+    metadata = proposer_record.get("metadata", {})
+    proposed_program_hash = ""
+    if isinstance(metadata, dict):
+        candidate_hash = metadata.get("candidate_hash")
+        if isinstance(candidate_hash, str):
+            proposed_program_hash = candidate_hash
+    if not proposed_program_hash:
+        proposed_program_hash = (
+            ucr.model_dump().get("hashes", {}).get("program_hash", "")
+            if ucr is not None
+            else ""
+        )
+    candidate_program = proposer_record.get("candidate_program")
+    if not isinstance(candidate_program, str):
+        candidate_program = ""
+    controller_version = ""
+    controller_policy_id = ""
+    controller_score_scaled = 0
+    controller_reason_atoms: list[str] = []
+    if controller_decision is not None:
+        controller_version = controller_decision.policy_version
+        controller_policy_id = controller_decision.policy_id
+        controller_score_scaled = int(controller_decision.score_scaled or 0)
+        controller_reason_atoms = sorted(set(controller_decision.reason_atoms))
+    train_synth_ns = len(cegis_result.tests) if cegis_result else 0
+    train_verify_ns = 0
+    for verdict in verdicts or []:
+        if verdict.cost:
+            for key in ("tests", "samples", "attempts"):
+                value = verdict.cost.get(key)
+                if isinstance(value, (int, float)):
+                    train_verify_ns += int(value)
+    train_breaker_ns = (
+        int(breaker_report.get("attempts", 0)) if isinstance(breaker_report, dict) else 0
+    )
+    costs_total = train_synth_ns + train_verify_ns + train_breaker_ns
+    train_record = {
+        "schema_version": "v1",
+        "task_id": task_id,
+        "domain": task.task_type if task else "",
+        "spec_signature": spec_signature,
+        "spec_hash": spec_hash,
+        "proposer": proposer_info,
+        "proposed_program_hash": proposed_program_hash,
+        "candidate_program": candidate_program,
+        "verdict": overall_verdict,
+        "failure_atoms": train_failure_atoms,
+        "controller_version": controller_version,
+        "controller_policy_id": controller_policy_id,
+        "controller_score_scaled": controller_score_scaled,
+        "controller_reason_atoms": controller_reason_atoms,
+        "coverage_atoms_added": sorted(coverage_atoms),
+        "costs": {
+            "synth_ns": int(train_synth_ns),
+            "verify_ns": int(train_verify_ns),
+            "breaker_ns": int(train_breaker_ns),
+            "total_ns": costs_total,
+        },
+    }
+    train_path = run_dir / "train_record.json"
+    train_bytes = canonical_dumps(train_record)
+    if not train_bytes.endswith(b"\n"):
+        train_bytes += b"\n"
+    train_path.write_bytes(train_bytes)
+
+    reuse_reject_reason_atoms: dict[str, list[str]] = {
+        "warm_start_reject_reason_atoms": sorted(set(warm_start_reject_reason_atoms)),
+        "promotion_reject_reason_atoms": sorted(set(promotion_reject_reason_atoms)),
+        "retrieval_reject_reason_atoms": sorted(set(retrieval_reject_reason_atoms)),
+    }
+    promotion_attempted = bool(reuse_attempted.get("promotion_attempted"))
+    promotion_used = reuse_source == "promotion"
+
     return {
         "run_id": run_dir.name,
         "task_id": task_id,
@@ -1075,10 +1496,26 @@ def episode_run(
         "witness_path": str(witness_path),
         "ucr_path": str(ucr_path),
         "active_view_hash": active_view_hash,
+        "spec_hash": spec_hash,
         "warm_start_provided": warm_start_provided,
         "warm_start_store": warm_start,
         "warm_start_candidate_hash": warm_start_candidate_hash,
         "warm_start_candidate_rejected": warm_start_candidate_rejected,
+        "warm_start_reject_reason_atoms": reuse_reject_reason_atoms[
+            "warm_start_reject_reason_atoms"
+        ],
+        "promotion_best_hash_used": promotion_best_hash_used,
+        "promotion_best_tier_used": promotion_best_tier_used,
+        "promotion_reject_reason_atoms": reuse_reject_reason_atoms[
+            "promotion_reject_reason_atoms"
+        ],
+        "promotion_attempted": promotion_attempted,
+        "promotion_best_hash": promotion_best_hash if promotion_attempted else "",
+        "promotion_best_tier": promotion_best_tier if promotion_attempted else "",
+        "promotion_used": promotion_used,
+        "reuse_source": reuse_source,
+        "reuse_attempted": reuse_attempted,
+        "reuse_reject_reason_atoms": reuse_reject_reason_atoms,
         "synth_ns": synth_cost,
         "verify_ns": verify_cost,
         "breaker_ns": breaker_cost,

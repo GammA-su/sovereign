@@ -16,3 +16,4 @@ __pycache__/
 # Runtime outputs
 runs/
 store/
+promoted_store/

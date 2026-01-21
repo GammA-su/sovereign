@@ -14,10 +14,17 @@ from rich.table import Table
 
 from .bg.bg_engine import BGEngine, compute_context_hash
 from .config import Settings
+from .coverage_ledger import CoverageLedger
 from .ledger.ledger import Ledger
 from .orchestrator.episode import episode_run
 from .orchestrator.task import load_task
-from .proposer_api import BaseProposer, ReplayProposer, StaticProposer, SubprocessProposer
+from .proposer_api import (
+    BaseProposer,
+    ReplayProposer,
+    RetrievalProposer,
+    StaticProposer,
+    SubprocessProposer,
+)
 from .pyfunc.runner import PYEXEC_VERSION
 from .schemas import UCR, export_schemas
 from .store.audit import audit_store
@@ -27,6 +34,7 @@ from .utils import (
     hash_bytes,
     read_json,
     read_jsonl,
+    stable_hash,
     write_json,
     write_jsonl_line,
 )
@@ -48,6 +56,10 @@ POLICY_OPTION = typer.Option("v1", "--policy-version")
 SCHEMA_OUT_OPTION = typer.Option(Path("schemas"), "--out-dir")
 WARM_START_OPTION = typer.Option(None, "--warm-start-store", exists=True, file_okay=False)
 SUITE_WARM_START_OPTION = typer.Option(None, "--warm-start-store", exists=True, file_okay=False)
+PROMOTION_STORE_OPTION = typer.Option(None, "--promotion-store", file_okay=False)
+PREFER_PROMOTION_STORE_OPTION = typer.Option(False, "--prefer-promotion-store")
+PREFER_PROMOTION_TIER_OPTION = typer.Option("sealed", "--prefer-promotion-tier")
+PROMOTION_TIER_STRICT_OPTION = typer.Option(False, "--promotion-tier-strict")
 SUITE_FILE_OPTION = typer.Option(..., "--suite-file", exists=True)
 OUT_DIR_OPTION = typer.Option(..., "--out-dir")
 STORE_DIR_OPTION = typer.Option(..., "--store", exists=True, file_okay=False)
@@ -57,8 +69,18 @@ DOCTOR_SMOKE_OPTION = typer.Option(False, "--smoke")
 PROPOSER_OPTION = typer.Option("stub", "--proposer")
 STATIC_PROGRAM_OPTION = typer.Option(None, "--static-program")
 REPLAY_FILE_OPTION = typer.Option(None, "--replay-file")
+RETRIEVAL_DATASET_OPTION = typer.Option(None, "--retrieval-dataset", exists=True)
 CMD_OPTION = typer.Option(None, "--cmd")
 RECORD_PROPOSALS_OPTION = typer.Option(None, "--record-proposals")
+SEALED_SUITE_FILE_OPTION = typer.Option(
+    Path("examples/sealed/sealed_v3.json"), "--sealed-suite-file", exists=True
+)
+LEARN_OUT_ROOT_OPTION = typer.Option(..., "--out-root")
+LEARN_ITERS_OPTION = typer.Option(..., "--iters")
+LEARN_PROMOTION_STORE_OPTION = typer.Option(..., "--promotion-store", file_okay=False)
+LEARN_USE_RETRIEVAL_OPTION = typer.Option(False, "--use-retrieval")
+LEARN_RETRIEVAL_DATASET_SOURCE_OPTION = typer.Option("A", "--retrieval-dataset-source")
+SEALED_RUN_OPTION = typer.Option(False, "--sealed-run", hidden=True)
 
 
 episode_app = typer.Typer(help="Episode commands")
@@ -69,6 +91,7 @@ schema_app = typer.Typer(help="Schema utilities")
 run_app = typer.Typer(help="Run audits")
 store_app = typer.Typer(help="Store commands")
 suite_app = typer.Typer(help="Suites")
+learn_app = typer.Typer(help="Learn loops")
 
 
 @app.callback()
@@ -94,6 +117,7 @@ def _build_proposer(
     proposer_kind: str,
     static_program: Optional[str],
     replay_file: Optional[Path],
+    retrieval_dataset: Optional[Path],
     cmd: Optional[List[str]],
 ) -> Optional[BaseProposer]:
     if proposer_kind in {"stub", "default"}:
@@ -107,6 +131,10 @@ def _build_proposer(
         if replay_file is None:
             raise typer.BadParameter("missing --replay-file for replay proposer")
         return ReplayProposer(replay_file)
+    if proposer_kind == "retrieval":
+        if retrieval_dataset is None:
+            raise typer.BadParameter("missing --retrieval-dataset for retrieval proposer")
+        return RetrievalProposer(retrieval_dataset)
     if proposer_kind == "subprocess":
         if not cmd:
             raise typer.BadParameter("missing --cmd for subprocess proposer")
@@ -147,20 +175,35 @@ def episode_run_cmd(
     run_id: Optional[str] = RUN_ID_OPTION,
     config: Optional[Path] = CONFIG_OPTION,
     warm_start_store: Optional[Path] = WARM_START_OPTION,
+    promotion_store: Optional[Path] = PROMOTION_STORE_OPTION,
+    prefer_promotion_store: bool = PREFER_PROMOTION_STORE_OPTION,
+    prefer_promotion_tier: str = PREFER_PROMOTION_TIER_OPTION,
+    promotion_tier_strict: bool = PROMOTION_TIER_STRICT_OPTION,
     proposer_kind: str = PROPOSER_OPTION,
     static_program: Optional[str] = STATIC_PROGRAM_OPTION,
     replay_file: Optional[Path] = REPLAY_FILE_OPTION,
+    retrieval_dataset: Optional[Path] = RETRIEVAL_DATASET_OPTION,
     cmd: Optional[List[str]] = CMD_OPTION,
 ) -> None:
     settings = _load_settings(config)
     if warm_start_store:
         settings = settings.model_copy(update={"warm_start_store": str(warm_start_store)})
+    if promotion_store:
+        settings = settings.model_copy(update={"promotion_store": str(promotion_store)})
+    if prefer_promotion_store:
+        settings = settings.model_copy(update={"prefer_promotion_store": True})
+    if prefer_promotion_tier:
+        settings = settings.model_copy(
+            update={"prefer_promotion_tier": prefer_promotion_tier}
+        )
+    if promotion_tier_strict:
+        settings = settings.model_copy(update={"promotion_tier_strict": True})
     if run_dir is None:
         run_root = Path("runs")
         ensure_dir(run_root)
         run_name = run_id or f"run_{task_file.stem}"
         run_dir = run_root / run_name
-    proposer = _build_proposer(proposer_kind, static_program, replay_file, cmd)
+    proposer = _build_proposer(proposer_kind, static_program, replay_file, retrieval_dataset, cmd)
     summary = episode_run(
         task_file=task_file,
         run_dir=run_dir,
@@ -553,7 +596,12 @@ def doctor_cmd(
         "scripts/ci_golden_suite_v6.sh",
         "scripts/ci_golden_suite_v6_warm.sh",
         "scripts/ci_golden_suite_v7.sh",
+        "scripts/ci_golden_suite_v8.sh",
+        "scripts/ci_golden_suite_v9.sh",
+        "scripts/ci_golden_suite_v10.sh",
+        "scripts/ci_golden_suite_v8_replay.sh",
         "scripts/ci_sealed.sh",
+        "scripts/ci_promo_smoke.sh",
     ]
     scripts_ok = True
     for script in scripts:
@@ -567,10 +615,64 @@ def doctor_cmd(
             scripts_ok = False
     checks["scripts"] = scripts_ok
 
+    # promoted_store is ignored.
+    gitignore_ok = True
+    gitignore_path = root / ".gitignore"
+    if not gitignore_path.exists():
+        missing.append("missing_gitignore:promoted_store/")
+        gitignore_ok = False
+    else:
+        content = gitignore_path.read_text(encoding="utf-8")
+        if "promoted_store/" not in content:
+            missing.append("missing_gitignore:promoted_store/")
+            gitignore_ok = False
+    checks["gitignore"] = gitignore_ok
+
+    # Promotion store index sanity.
+    promo_ok = True
+    promo_paths = [
+        root / "promoted_store" / "v1" / "index.json",
+        root / "promoted_store" / "index.json",
+    ]
+    promo_index_path = next((path for path in promo_paths if path.exists()), None)
+    if promo_index_path is not None:
+        try:
+            promo_data = read_json(promo_index_path)
+        except Exception:
+            missing.append(f"promotion_index_bad_json:{promo_index_path}")
+            promo_ok = False
+            promo_data = {}
+        schema_version = str(promo_data.get("schema_version", "v1"))
+        if schema_version == "v1":
+            warnings.append("promotion_index_legacy_v1")
+        if schema_version == "v2":
+            entries = promo_data.get("entries", {})
+            if not isinstance(entries, dict):
+                missing.append("promotion_index_bad_entries")
+                promo_ok = False
+            else:
+                required_fields = {
+                    "program_hash",
+                    "spec_hash",
+                    "score",
+                    "score_key",
+                    "store_path",
+                }
+                for entry in entries.values():
+                    if not isinstance(entry, dict):
+                        missing.append("promotion_index_bad_entry")
+                        promo_ok = False
+                        break
+                    if not required_fields.issubset(entry.keys()):
+                        missing.append("promotion_index_missing_fields")
+                        promo_ok = False
+                        break
+    checks["promotion_index"] = promo_ok
+
     # Suites and baselines.
     suites_ok = True
     baselines_ok = True
-    for version in range(1, 8):
+    for version in range(1, 11):
         suite_path = root / "examples" / "suites" / f"suite_v{version}.json"
         if not check_json(suite_path, "suite"):
             suites_ok = False
@@ -579,6 +681,9 @@ def doctor_cmd(
         )
         if not check_json(baseline_path, "baseline", require_newline=True):
             baselines_ok = False
+    replay_baseline = root / "examples" / "baselines" / "suite_v8_replay.report.norm.json"
+    if not check_json(replay_baseline, "baseline", require_newline=True):
+        baselines_ok = False
     checks["suites"] = suites_ok
     checks["baselines"] = baselines_ok
     checks["baseline_newlines"] = baselines_ok
@@ -597,6 +702,8 @@ def doctor_cmd(
         content = ci_all_path.read_text(encoding="utf-8")
         for script in scripts[1:]:
             script_name = Path(script).name
+            if script_name == "ci_golden_suite_v8_replay.sh":
+                continue
             if script_name not in content:
                 missing.append(f"ci_all_missing_ref:{script}")
                 ci_all_refs_ok = False
@@ -670,6 +777,26 @@ def normalize_suite_report(report: dict[str, Any]) -> dict[str, Any]:
         if isinstance(fd, dict):
             fd.pop("witness_id", None)
             t["forge_decision"] = fd
+        controller = t.get("controller")
+        if isinstance(controller, dict):
+            norm_controller: dict[str, Any] = {}
+            if "policy_id" in controller:
+                norm_controller["policy_id"] = controller.get("policy_id")
+            if "reason_atoms" in controller:
+                norm_controller["reason_atoms"] = controller.get("reason_atoms")
+            if "decision" in controller:
+                norm_controller["decision"] = controller.get("decision")
+            t["controller"] = norm_controller
+        if "controller_score_scaled" in t:
+            try:
+                t["controller_score_scaled"] = int(t["controller_score_scaled"])
+            except (TypeError, ValueError):
+                t.pop("controller_score_scaled", None)
+        if "controller_score" in t:
+            try:
+                t["controller_score"] = int(t["controller_score"])
+            except (TypeError, ValueError):
+                t.pop("controller_score", None)
     totals = r.get("totals")
     if isinstance(totals, dict):
         totals.pop("verify_ns", None)
@@ -703,6 +830,19 @@ def ensure_trailing_newline(path: Path) -> None:
         path.write_bytes(data + b"\n")
 
 
+def _jsonl_blob(records: List[dict[str, Any]]) -> bytes:
+    lines = [canonical_dumps(record) for record in records]
+    blob = b"\n".join(lines)
+    if not blob.endswith(b"\n"):
+        blob += b"\n"
+    return blob
+
+
+def _split_bucket(task_id: str) -> int:
+    digest = stable_hash(task_id)
+    return int(digest[:8], 16) % 10
+
+
 def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
     suite_data = read_json(suite_file)
     suite_id = suite_data.get("suite_id", suite_file.stem)
@@ -712,7 +852,11 @@ def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
     }
     totals = {"pass": 0, "fail": 0}
     per_domain: dict[str, dict[str, int]] = {}
+    kpi_sums: dict[str, dict[str, float]] = {}
+    kpi_counts: dict[str, dict[str, int]] = {}
     tasks_summary: list[dict[str, str]] = []
+    mismatches: list[dict[str, str]] = []
+    kpi_keys = ("CDR", "TMR", "NOVN", "WFHR")
     for entry in tasks:
         if not isinstance(entry, dict):
             continue
@@ -722,7 +866,20 @@ def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
         task = load_task(task_file)
         entry_report = per_task.get(task.task_id, {})
         verdict = str(entry_report.get("verdict", "FAIL"))
-        tasks_summary.append({"task_id": task.task_id, "verdict": verdict})
+        summary_entry = {"task_id": task.task_id, "verdict": verdict}
+        expected_verdict = entry.get("expected_verdict")
+        if isinstance(expected_verdict, str):
+            expected = expected_verdict.upper()
+            summary_entry["expected_verdict"] = expected
+            if expected and expected != verdict:
+                mismatches.append(
+                    {
+                        "task_id": task.task_id,
+                        "expected_verdict": expected,
+                        "actual_verdict": verdict,
+                    }
+                )
+        tasks_summary.append(summary_entry)
         if verdict == "PASS":
             totals["pass"] += 1
         else:
@@ -732,12 +889,99 @@ def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
             domain_counts["pass"] += 1
         else:
             domain_counts["fail"] += 1
+        breaker_kpi = entry_report.get("breaker_kpi", {})
+        if isinstance(breaker_kpi, dict):
+            if breaker_kpi.get("status") != "SKIPPED" and not breaker_kpi.get("skipped"):
+                domain_sums = kpi_sums.setdefault(task.task_type, {})
+                domain_counts = kpi_counts.setdefault(task.task_type, {})
+                for key in kpi_keys:
+                    value = breaker_kpi.get(key)
+                    if isinstance(value, (int, float)):
+                        domain_sums[key] = domain_sums.get(key, 0.0) + float(value)
+                        domain_counts[key] = domain_counts.get(key, 0) + 1
+
+    per_domain_kpi: dict[str, dict[str, float]] = {}
+    for domain in sorted(per_domain.keys()):
+        sums = kpi_sums.get(domain, {})
+        counts = kpi_counts.get(domain, {})
+        averages: dict[str, float] = {}
+        for key in kpi_keys:
+            count = counts.get(key, 0)
+            total = sums.get(key, 0.0)
+            value = total / count if count else 0.0
+            averages[key] = float(f"{value:.6f}")
+        per_domain_kpi[domain] = averages
     return {
         "suite_id": suite_id,
+        "families_mode": "sealed",
         "totals": totals,
         "per_domain": per_domain,
+        "per_domain_kpi_averages": per_domain_kpi,
+        "mismatches": mismatches,
         "tasks": tasks_summary,
     }
+
+
+def _suite_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    totals = report.get("totals", {})
+    pass_count = int(totals.get("pass", 0))
+    fail_count = int(totals.get("fail", 0))
+    coverage_new_atoms = int(totals.get("coverage_new_atoms", 0))
+    per_task = report.get("per_task", [])
+    score_sum = 0
+    promotion_hits = 0
+    for entry in per_task:
+        if not isinstance(entry, dict):
+            continue
+        score = entry.get("controller_score_scaled")
+        if isinstance(score, (int, float)):
+            score_sum += int(score)
+        if entry.get("promotion_best_hash_used"):
+            promotion_hits += 1
+    store_updates = report.get("store_updates", [])
+    store_updates_count = len(store_updates) if isinstance(store_updates, list) else 0
+    return {
+        "totals": {
+            "pass": pass_count,
+            "fail": fail_count,
+            "controller_score_sum_scaled": score_sum,
+            "coverage_new_atoms": coverage_new_atoms,
+            "store_updates_count": store_updates_count,
+        },
+        "promotion_hit_count": promotion_hits,
+    }
+
+
+def _sealed_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    mismatches = summary.get("mismatches", [])
+    mismatches_count = len(mismatches) if isinstance(mismatches, list) else 0
+    per_domain_kpi = summary.get("per_domain_kpi_averages", {})
+    if not isinstance(per_domain_kpi, dict):
+        per_domain_kpi = {}
+    return {
+        "ok": mismatches_count == 0,
+        "mismatches_count": mismatches_count,
+        "per_domain_kpi_averages": per_domain_kpi,
+    }
+
+
+def _promotion_index_size(store_dir: Path) -> int:
+    index_path = Path(store_dir) / "index.json"
+    if not index_path.exists():
+        return 0
+    data = read_json(index_path)
+    if not isinstance(data, dict):
+        return 0
+    entries = data.get("entries", {})
+    if isinstance(entries, dict) and entries:
+        return len(entries)
+    legacy = data.get("legacy_entries", {})
+    size = 0
+    if isinstance(legacy, dict):
+        for domain_entries in legacy.values():
+            if isinstance(domain_entries, dict):
+                size += len(domain_entries)
+    return size
 
 
 @suite_app.command("run")
@@ -746,18 +990,24 @@ def suite_run_cmd(
     out_dir: Path = OUT_DIR_OPTION,
     policy_version: str = POLICY_OPTION,
     warm_start_store: Optional[Path] = SUITE_WARM_START_OPTION,
+    promotion_store: Optional[Path] = PROMOTION_STORE_OPTION,
+    prefer_promotion_store: bool = PREFER_PROMOTION_STORE_OPTION,
+    prefer_promotion_tier: str = PREFER_PROMOTION_TIER_OPTION,
+    promotion_tier_strict: bool = PROMOTION_TIER_STRICT_OPTION,
     proposer_kind: str = PROPOSER_OPTION,
     static_program: Optional[str] = STATIC_PROGRAM_OPTION,
     replay_file: Optional[Path] = REPLAY_FILE_OPTION,
+    retrieval_dataset: Optional[Path] = RETRIEVAL_DATASET_OPTION,
     cmd: Optional[List[str]] = CMD_OPTION,
     record_proposals: Optional[Path] = RECORD_PROPOSALS_OPTION,
+    sealed_run: bool = SEALED_RUN_OPTION,
 ) -> None:
     suite_data = read_json(suite_file)
     suite_id = suite_data.get("suite_id", suite_file.stem)
     tasks = suite_data.get("tasks", [])
     report_dir = out_dir
     ensure_dir(report_dir)
-    proposer = _build_proposer(proposer_kind, static_program, replay_file, cmd)
+    proposer = _build_proposer(proposer_kind, static_program, replay_file, retrieval_dataset, cmd)
     record_path = Path(record_proposals) if record_proposals else None
     if record_path and record_path.exists():
         record_path.unlink()
@@ -773,16 +1023,37 @@ def suite_run_cmd(
         manifest["schema_version"] = "v2"
     programs: dict[str, dict[str, Any]] = manifest.setdefault("programs", {})
 
-    totals = {"pass": 0, "fail": 0, "audit_failures": 0, "verify_ns": 0, "breaker_attempts": 0}
+    totals: dict[str, Any] = {
+        "pass": 0,
+        "fail": 0,
+        "audit_failures": 0,
+        "verify_ns": 0,
+        "breaker_attempts": 0,
+    }
     per_task: List[dict[str, Any]] = []
     store_updates: List[dict[str, str]] = []
+    coverage = CoverageLedger()
+    dataset_records: List[dict[str, Any]] = []
+    dataset_total_ns = 0
 
     for entry in tasks:
         task_file = Path(entry["task_file"])
         task = load_task(task_file)
         overrides = dict(entry.get("overrides", {}))
+        if policy_version and not overrides.get("policy_version"):
+            overrides["policy_version"] = policy_version
         if warm_start_store and not overrides.get("warm_start_store"):
             overrides["warm_start_store"] = str(warm_start_store)
+        if promotion_store and not overrides.get("promotion_store"):
+            overrides["promotion_store"] = str(promotion_store)
+        if prefer_promotion_store and "prefer_promotion_store" not in overrides:
+            overrides["prefer_promotion_store"] = True
+        if prefer_promotion_tier and "prefer_promotion_tier" not in overrides:
+            overrides["prefer_promotion_tier"] = prefer_promotion_tier
+        if promotion_tier_strict and "promotion_tier_strict" not in overrides:
+            overrides["promotion_tier_strict"] = True
+        if sealed_run and "is_sealed_run" not in overrides:
+            overrides["is_sealed_run"] = True
         settings = Settings(**overrides)
         task_run_dir = report_dir / task_file.stem
         summary = episode_run(
@@ -812,6 +1083,30 @@ def suite_run_cmd(
                 record_entry["error_atom"] = error_atom
             write_jsonl_line(record_path, record_entry)
         ucr_data = read_json(actual_run / "ucr.json")
+        verifier_report: list[dict[str, Any]] = []
+        verifier_path = actual_run / "artifacts" / "reports" / "verifier.json"
+        if verifier_path.exists():
+            verifier_report = read_json(verifier_path)
+        breaker_report: dict[str, Any] = {}
+        breaker_report_path = actual_run / "artifacts" / "reports" / "breaker.json"
+        if breaker_report_path.exists():
+            breaker_report = read_json(breaker_report_path)
+        coverage.update_from_episode(
+            ucr=ucr_data,
+            verifier=verifier_report,
+            breaker=breaker_report,
+            task=task,
+        )
+        train_record_path = actual_run / "train_record.json"
+        if train_record_path.exists():
+            train_record = read_json(train_record_path)
+            if isinstance(train_record, dict):
+                dataset_records.append(train_record)
+                costs = train_record.get("costs", {})
+                if isinstance(costs, dict):
+                    total_ns = costs.get("total_ns", 0)
+                    if isinstance(total_ns, (int, float)):
+                        dataset_total_ns += int(total_ns)
         program_hash = ucr_data.get("hashes", {}).get("program_hash", "")
         decision_path = actual_run / "forge" / "decision.json"
         decision_data: dict[str, Any] = {}
@@ -819,6 +1114,25 @@ def suite_run_cmd(
             decision_data = read_json(decision_path)
         if not decision_data:
             decision_data = {"decision": "REJECT", "reason": "unknown"}
+        controller_data: dict[str, Any] = {}
+        controller_path = actual_run / "controller.json"
+        if controller_path.exists():
+            controller_data = read_json(controller_path)
+        controller_v2_policy_id = None
+        controller_v2_score = None
+        controller_v2_reason_atoms = None
+        controller_v3_policy_id = None
+        controller_v3_score = None
+        controller_v3_reason_atoms = None
+        controller_version = controller_data.get("policy_version")
+        if controller_version == "v2":
+            controller_v2_policy_id = controller_data.get("policy_id", "")
+            controller_v2_score = controller_data.get("score_scaled")
+            controller_v2_reason_atoms = controller_data.get("reason_atoms", [])
+        if controller_version == "v3":
+            controller_v3_policy_id = controller_data.get("policy_id", "")
+            controller_v3_score = controller_data.get("score_scaled")
+            controller_v3_reason_atoms = controller_data.get("reason_atoms", [])
         breaker_kpi: dict[str, Any] = {}
         breaker_path = actual_run / "artifacts" / "reports" / "breaker_kpi.json"
         if breaker_path.exists():
@@ -837,26 +1151,72 @@ def suite_run_cmd(
             "breaker_attempts": summary.get("breaker_attempts", 0),
             "meta_cases": summary.get("meta_cases", 0),
         }
-        per_task.append(
-            {
-                "task_id": summary["task_id"],
-                "verdict": summary["verdict"],
-                "active_view_hash": summary["active_view_hash"],
-                "program_hash": program_hash,
-                "breaker_kpi": breaker_kpi,
-                "forge_decision": decision_data,
-                "audit_ok": audit_report["ok"],
-                "synth_ns": summary.get("synth_ns", 0),
-                "cost": cost,
-                "attempts": attempts,
-                "warm_start_store": summary.get("warm_start_store", False),
-                "warm_start_candidate_hash": summary.get("warm_start_candidate_hash", ""),
-                "warm_start_candidate_rejected": summary.get(
-                    "warm_start_candidate_rejected", False
-                ),
-                "warm_start_provided": summary.get("warm_start_provided", False),
-            }
-        )
+        task_entry = {
+            "task_id": summary["task_id"],
+            "verdict": summary["verdict"],
+            "active_view_hash": summary["active_view_hash"],
+            "program_hash": program_hash,
+            "domain": task.task_type,
+            "spec_hash": summary.get("spec_hash", ""),
+            "breaker_kpi": breaker_kpi,
+            "forge_decision": decision_data,
+            "controller": controller_data,
+            "audit_ok": audit_report["ok"],
+            "synth_ns": summary.get("synth_ns", 0),
+            "cost": cost,
+            "attempts": attempts,
+            "warm_start_store": summary.get("warm_start_store", False),
+            "warm_start_candidate_hash": summary.get("warm_start_candidate_hash", ""),
+            "warm_start_candidate_rejected": summary.get(
+                "warm_start_candidate_rejected", False
+            ),
+            "warm_start_provided": summary.get("warm_start_provided", False),
+            "reuse_source": summary.get("reuse_source", "none"),
+            "reuse_attempted": summary.get(
+                "reuse_attempted",
+                {
+                    "warm_start_attempted": False,
+                    "promotion_attempted": False,
+                    "retrieval_attempted": False,
+                },
+            ),
+            "reuse_reject_reason_atoms": summary.get(
+                "reuse_reject_reason_atoms",
+                {
+                    "warm_start_reject_reason_atoms": [],
+                    "promotion_reject_reason_atoms": [],
+                    "retrieval_reject_reason_atoms": [],
+                },
+            ),
+            "promotion_attempted": summary.get("promotion_attempted", False),
+            "promotion_best_hash": summary.get("promotion_best_hash", ""),
+            "promotion_best_tier": summary.get("promotion_best_tier", ""),
+            "promotion_used": summary.get("promotion_used", False),
+            "promotion_reject_reason_atoms": summary.get(
+                "promotion_reject_reason_atoms", []
+            ),
+        }
+        warm_reject_atoms = summary.get("warm_start_reject_reason_atoms", [])
+        if warm_reject_atoms:
+            task_entry["warm_start_reject_reason_atoms"] = warm_reject_atoms
+        promotion_reject_atoms = summary.get("promotion_reject_reason_atoms", [])
+        if promotion_reject_atoms:
+            task_entry["promotion_reject_reason_atoms"] = promotion_reject_atoms
+        promotion_hash_used = summary.get("promotion_best_hash_used", "")
+        promotion_tier_used = summary.get("promotion_best_tier_used", "")
+        if promotion_hash_used:
+            task_entry["promotion_best_hash_used"] = promotion_hash_used
+            task_entry["promotion_best_tier_used"] = promotion_tier_used or ""
+        if controller_v2_policy_id is not None:
+            task_entry["controller_policy_id"] = controller_v2_policy_id
+            task_entry["controller_score_scaled"] = controller_v2_score
+            task_entry["controller_reason_atoms"] = controller_v2_reason_atoms
+        if controller_v3_policy_id is not None:
+            task_entry["controller_version"] = controller_version
+            task_entry["controller_policy_id"] = controller_v3_policy_id
+            task_entry["controller_score_scaled"] = controller_v3_score
+            task_entry["controller_reason_atoms"] = controller_v3_reason_atoms
+        per_task.append(task_entry)
         if summary["verdict"] == "PASS":
             totals["pass"] += 1
         else:
@@ -868,6 +1228,7 @@ def suite_run_cmd(
         if decision_data.get("decision") == "ADMIT" and program_hash:
             program_entry = programs.get(program_hash)
             manifest_spec = task.spec_signature()
+            manifest_spec_hash = task.spec_hash()
             io_schema_hash = task.io_schema_hash()
             if task.task_type == "pyfunc":
                 ext = ".py"
@@ -926,6 +1287,7 @@ def suite_run_cmd(
                     "program_hash": program_hash,
                     "domain": task.task_type,
                     "spec_signature": manifest_spec,
+                    "spec_hash": manifest_spec_hash,
                     "io_schema_hash": io_schema_hash,
                     "admitted_by_task": summary["task_id"],
                     "admit_count": 1,
@@ -951,6 +1313,7 @@ def suite_run_cmd(
                 program_entry["admit_count"] = admit_count + 1
                 program_entry["admitted_count"] = program_entry["admit_count"]
                 program_entry["spec_signature"] = manifest_spec
+                program_entry["spec_hash"] = manifest_spec_hash
                 program_entry["io_schema_hash"] = io_schema_hash
                 if task.task_type == "pyfunc":
                     program_entry["pyexec_version"] = PYEXEC_VERSION
@@ -962,6 +1325,65 @@ def suite_run_cmd(
                         entry_witnesses.append(witness_id)
 
     write_json(manifest_path, manifest)
+    coverage_totals = coverage.to_payload().get("totals", {})
+    coverage_new_atoms = int(coverage_totals.get("new_atoms", 0))
+    coverage_new_atoms_per_ns = int(
+        round(coverage_new_atoms * 1_000_000 / max(1, dataset_total_ns))
+    )
+    totals["coverage_new_atoms"] = coverage_new_atoms
+    totals["coverage_new_atoms_per_ns"] = coverage_new_atoms_per_ns
+    reuse_counts = {"promotion_used": 0, "retrieval_used": 0, "warm_used": 0}
+    reuse_attempt_counts = {
+        "promotion_attempted": 0,
+        "retrieval_attempted": 0,
+        "warm_attempted": 0,
+    }
+    reuse_reject_counts = {
+        "spec_mismatch_total": 0,
+        "domain_mismatch_total": 0,
+        "validation_fail_total": 0,
+        "not_found_total": 0,
+    }
+    for entry in per_task:
+        if not isinstance(entry, dict):
+            continue
+        reuse_source = entry.get("reuse_source")
+        if reuse_source == "promotion":
+            reuse_counts["promotion_used"] += 1
+        elif reuse_source == "retrieval":
+            reuse_counts["retrieval_used"] += 1
+        elif reuse_source == "warm_start":
+            reuse_counts["warm_used"] += 1
+        attempted = entry.get("reuse_attempted", {})
+        if isinstance(attempted, dict):
+            if attempted.get("promotion_attempted"):
+                reuse_attempt_counts["promotion_attempted"] += 1
+            if attempted.get("retrieval_attempted"):
+                reuse_attempt_counts["retrieval_attempted"] += 1
+            if attempted.get("warm_start_attempted"):
+                reuse_attempt_counts["warm_attempted"] += 1
+        reject_atoms = entry.get("reuse_reject_reason_atoms", {})
+        if isinstance(reject_atoms, dict):
+            for atoms in reject_atoms.values():
+                if not isinstance(atoms, list):
+                    continue
+                for atom in atoms:
+                    if atom in {"SPEC_MISMATCH", "PROMOTION_SPEC_MISMATCH"}:
+                        reuse_reject_counts["spec_mismatch_total"] += 1
+                    elif atom == "DOMAIN_MISMATCH":
+                        reuse_reject_counts["domain_mismatch_total"] += 1
+                    elif atom in {"VALIDATION_FAIL", "PROMOTION_VALIDATION_FAILED"}:
+                        reuse_reject_counts["validation_fail_total"] += 1
+                    elif atom in {
+                        "NOT_FOUND",
+                        "PROMOTION_NOT_FOUND",
+                        "PROMOTION_TIER_NOT_FOUND",
+                    }:
+                        reuse_reject_counts["not_found_total"] += 1
+    totals["reuse_counts"] = reuse_counts
+    totals["reuse_attempt_counts"] = reuse_attempt_counts
+    totals["reuse_reject_counts"] = reuse_reject_counts
+
     report = {
         "suite_id": suite_id,
         "policy_version": policy_version,
@@ -969,6 +1391,9 @@ def suite_run_cmd(
         "totals": totals,
         "store_updates": store_updates,
     }
+    if sealed_run:
+        report["families_mode"] = "sealed"
+        report["is_sealed_run"] = True
     report_path = report_dir / "report.json"
     write_json(report_path, report)
     ensure_trailing_newline(report_path)
@@ -976,6 +1401,49 @@ def suite_run_cmd(
     norm_path = report_dir / "report.norm.json"
     write_json(norm_path, norm_report)
     ensure_trailing_newline(norm_path)
+    dataset_path = report_dir / "dataset.jsonl"
+    dataset_records.sort(key=lambda item: str(item.get("task_id", "")))
+    dataset_blob = _jsonl_blob(dataset_records)
+    dataset_path.write_bytes(dataset_blob)
+    train_records: List[dict[str, Any]] = []
+    val_records: List[dict[str, Any]] = []
+    for record in dataset_records:
+        task_id = str(record.get("task_id", ""))
+        if _split_bucket(task_id) == 0:
+            val_records.append(record)
+        else:
+            train_records.append(record)
+    train_path = report_dir / "train.jsonl"
+    val_path = report_dir / "val.jsonl"
+    train_blob = _jsonl_blob(train_records)
+    val_blob = _jsonl_blob(val_records)
+    train_path.write_bytes(train_blob)
+    val_path.write_bytes(val_blob)
+    fields_whitelist = sorted(
+        {key for record in dataset_records for key in record.keys()}
+    )
+    dataset_meta = {
+        "schema_version": "v1",
+        "suite_id": suite_id,
+        "counts": {
+            "total": len(dataset_records),
+            "train": len(train_records),
+            "val": len(val_records),
+        },
+        "hashes": {
+            "dataset.jsonl": hash_bytes(dataset_blob),
+            "train.jsonl": hash_bytes(train_blob),
+            "val.jsonl": hash_bytes(val_blob),
+        },
+        "fields_whitelist": fields_whitelist,
+    }
+    dataset_meta_path = report_dir / "dataset_meta.json"
+    meta_blob = canonical_dumps(dataset_meta)
+    if not meta_blob.endswith(b"\n"):
+        meta_blob += b"\n"
+    dataset_meta_path.write_bytes(meta_blob)
+    coverage_path = report_dir / "coverage.json"
+    coverage_path.write_bytes(coverage.to_json())
     console.print({"report": str(report_path)})
 
 
@@ -985,12 +1453,33 @@ def suite_run_sealed_cmd(
     out_dir: Path = OUT_DIR_OPTION,
     policy_version: str = POLICY_OPTION,
     warm_start_store: Optional[Path] = SUITE_WARM_START_OPTION,
+    promotion_store: Optional[Path] = PROMOTION_STORE_OPTION,
+    prefer_promotion_store: bool = PREFER_PROMOTION_STORE_OPTION,
+    prefer_promotion_tier: str = PREFER_PROMOTION_TIER_OPTION,
+    promotion_tier_strict: bool = PROMOTION_TIER_STRICT_OPTION,
+    proposer_kind: str = PROPOSER_OPTION,
+    static_program: Optional[str] = STATIC_PROGRAM_OPTION,
+    replay_file: Optional[Path] = REPLAY_FILE_OPTION,
+    retrieval_dataset: Optional[Path] = RETRIEVAL_DATASET_OPTION,
+    cmd: Optional[List[str]] = CMD_OPTION,
+    record_proposals: Optional[Path] = RECORD_PROPOSALS_OPTION,
 ) -> None:
     suite_run_cmd(
         suite_file=suite_file,
         out_dir=out_dir,
         policy_version=policy_version,
         warm_start_store=warm_start_store,
+        promotion_store=promotion_store,
+        prefer_promotion_store=prefer_promotion_store,
+        prefer_promotion_tier=prefer_promotion_tier,
+        promotion_tier_strict=promotion_tier_strict,
+        sealed_run=True,
+        proposer_kind=proposer_kind,
+        static_program=static_program,
+        replay_file=replay_file,
+        retrieval_dataset=retrieval_dataset,
+        cmd=cmd,
+        record_proposals=record_proposals,
     )
     report_path = Path(out_dir) / "report.json"
     report = read_json(report_path)
@@ -998,7 +1487,102 @@ def suite_run_sealed_cmd(
     summary_path = Path(out_dir) / "sealed_summary.json"
     write_json(summary_path, summary)
     ensure_trailing_newline(summary_path)
+    if summary.get("mismatches"):
+        raise typer.Exit(code=1)
     console.print({"sealed_summary": str(summary_path)})
+
+
+@learn_app.command("loop")
+def learn_loop_cmd(
+    suite_file: Path = SUITE_FILE_OPTION,
+    sealed_suite_file: Path = SEALED_SUITE_FILE_OPTION,
+    out_root: Path = LEARN_OUT_ROOT_OPTION,
+    iters: int = LEARN_ITERS_OPTION,
+    promotion_store: Path = LEARN_PROMOTION_STORE_OPTION,
+    prefer_promotion_tier: str = PREFER_PROMOTION_TIER_OPTION,
+    use_retrieval: bool = LEARN_USE_RETRIEVAL_OPTION,
+    retrieval_dataset_source: str = LEARN_RETRIEVAL_DATASET_SOURCE_OPTION,
+) -> None:
+    if iters < 1:
+        raise typer.BadParameter("--iters must be >= 1")
+    dataset_source = retrieval_dataset_source.upper()
+    if dataset_source not in {"A", "B"}:
+        raise typer.BadParameter("--retrieval-dataset-source must be A or B")
+    suite_data = read_json(suite_file)
+    suite_id = suite_data.get("suite_id", suite_file.stem)
+    sealed_data = read_json(sealed_suite_file)
+    sealed_suite_id = sealed_data.get("suite_id", sealed_suite_file.stem)
+    ensure_dir(out_root)
+
+    iterations: list[dict[str, Any]] = []
+    for idx in range(iters):
+        iter_dir = out_root / f"iter_{idx:03d}"
+        a_dir = iter_dir / "a"
+        b_dir = iter_dir / "b"
+        sealed_dir = iter_dir / "sealed"
+
+        suite_run_cmd(
+            suite_file=suite_file,
+            out_dir=a_dir,
+            promotion_store=promotion_store,
+            prefer_promotion_store=False,
+            prefer_promotion_tier=prefer_promotion_tier,
+        )
+
+        retrieval_dataset: Optional[Path] = None
+        if use_retrieval and idx > 0:
+            prev_dir = out_root / f"iter_{idx - 1:03d}" / dataset_source.lower()
+            candidate_path = prev_dir / "dataset.jsonl"
+            if candidate_path.exists():
+                retrieval_dataset = candidate_path
+        proposer_kind = "stub"
+        if use_retrieval and retrieval_dataset is not None:
+            proposer_kind = "retrieval"
+
+        suite_run_cmd(
+            suite_file=suite_file,
+            out_dir=b_dir,
+            promotion_store=promotion_store,
+            prefer_promotion_store=True,
+            prefer_promotion_tier=prefer_promotion_tier,
+            proposer_kind=proposer_kind,
+            retrieval_dataset=retrieval_dataset,
+        )
+
+        suite_run_sealed_cmd(
+            suite_file=sealed_suite_file,
+            out_dir=sealed_dir,
+        )
+
+        report_a = read_json(a_dir / "report.json")
+        report_b = read_json(b_dir / "report.json")
+        summary_a = _suite_metrics(report_a)
+        summary_b = _suite_metrics(report_b)
+        sealed_summary = read_json(sealed_dir / "sealed_summary.json")
+
+        iterations.append(
+            {
+                "iter": idx,
+                "a": {"totals": summary_a["totals"]},
+                "b": {
+                    "totals": summary_b["totals"],
+                    "promotion_hit_count": summary_b["promotion_hit_count"],
+                },
+                "sealed": _sealed_metrics(sealed_summary),
+                "promotion_store_index_size": _promotion_index_size(promotion_store),
+            }
+        )
+
+    loop_summary = {
+        "schema_version": "v1",
+        "suite_id": suite_id,
+        "sealed_suite_id": sealed_suite_id,
+        "iterations": iterations,
+    }
+    summary_path = out_root / "loop_summary.json"
+    write_json(summary_path, loop_summary)
+    ensure_trailing_newline(summary_path)
+    console.print({"loop_summary": str(summary_path)})
 
 
 @demo_app.command("bg")
@@ -1120,6 +1704,7 @@ app.add_typer(schema_app, name="schema")
 app.add_typer(run_app, name="run")
 app.add_typer(store_app, name="store")
 app.add_typer(suite_app, name="suite")
+app.add_typer(learn_app, name="learn")
 
 if __name__ == "__main__":
     app()

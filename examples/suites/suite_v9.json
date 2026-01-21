@@ -1,0 +1,29 @@
+{
+  "suite_id": "suite_v9",
+  "tasks": [
+    {
+      "task_file": "examples/tasks/pyfunc_meta_pass_01.json",
+      "overrides": {"policy_version": "v2"}
+    },
+    {
+      "task_file": "examples/tasks/pyfunc_meta_fail_01.json",
+      "overrides": {"policy_version": "v2"}
+    },
+    {
+      "task_file": "examples/tasks/codepatch_pass_01.json",
+      "overrides": {"policy_version": "v2"}
+    },
+    {
+      "task_file": "examples/tasks/codepatch_meta_fail_01.json",
+      "overrides": {"policy_version": "v2"}
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_pass_01.json",
+      "overrides": {"policy_version": "v2"}
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_meta_fail_01.json",
+      "overrides": {"policy_version": "v2"}
+    }
+  ]
+}

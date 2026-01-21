@@ -224,3 +224,121 @@ class SubprocessProposer:
             return self._error("missing_candidate")
         metadata = output.get("metadata", {})
         return Proposal.build(candidate_program, "subprocess", metadata=metadata)
+
+
+class RetrievalProposer:
+    def __init__(self, dataset_path: Path) -> None:
+        self.dataset_path = Path(dataset_path)
+        self.dataset_hash = (
+            hash_bytes(self.dataset_path.read_bytes()) if self.dataset_path.exists() else ""
+        )
+        self.index = self._load_index(self.dataset_path)
+
+    def _load_index(self, path: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        if not path.exists():
+            return {}
+        records: List[Dict[str, Any]] = []
+        if path.suffix == ".jsonl":
+            for line in path.read_bytes().splitlines():
+                if not line:
+                    continue
+                try:
+                    record = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+        else:
+            data = read_json(path)
+            if isinstance(data, list):
+                records = [item for item in data if isinstance(item, dict)]
+        index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for record in records:
+            if record.get("verdict") != "PASS":
+                continue
+            domain = record.get("domain")
+            spec_key = record.get("spec_hash") or record.get("spec_signature")
+            candidate_program = record.get("candidate_program")
+            if not isinstance(domain, str) or not isinstance(spec_key, str):
+                continue
+            if not isinstance(candidate_program, str) or not candidate_program:
+                continue
+            score = record.get("controller_score_scaled", 0)
+            score_value = int(score) if isinstance(score, (int, float)) else 0
+            program_hash = record.get("proposed_program_hash") or record.get("program_hash") or ""
+            program_hash = str(program_hash)
+            key = (domain, spec_key)
+            existing = index.get(key)
+            if existing is None:
+                index[key] = {
+                    "candidate_program": candidate_program,
+                    "score_scaled": score_value,
+                    "program_hash": program_hash,
+                }
+                continue
+            existing_score = int(existing.get("score_scaled", 0))
+            existing_hash = str(existing.get("program_hash", ""))
+            if score_value > existing_score:
+                index[key] = {
+                    "candidate_program": candidate_program,
+                    "score_scaled": score_value,
+                    "program_hash": program_hash,
+                }
+            elif score_value == existing_score and program_hash and program_hash < existing_hash:
+                index[key] = {
+                    "candidate_program": candidate_program,
+                    "score_scaled": score_value,
+                    "program_hash": program_hash,
+                }
+        return index
+
+    def _fallback_program(self, task: Task) -> str:
+        if task.task_type == "pyfunc":
+            return str(task.metadata.get("pyfunc", {}).get("candidate_program", ""))
+        if task.task_type == "codepatch":
+            return str(task.metadata.get("codepatch", {}).get("candidate_patch", ""))
+        if task.task_type == "jsonspec":
+            candidate_spec = task.metadata.get("jsonspec", {}).get("candidate_program")
+            if isinstance(candidate_spec, dict):
+                return canonical_dumps(candidate_spec).decode("utf-8")
+            if isinstance(candidate_spec, str):
+                return candidate_spec
+        return ""
+
+    def propose(
+        self,
+        task: Task,
+        *,
+        domain: str,
+        spec_signature: str,
+        seed: int,
+        max_tokens: Optional[int] = None,
+    ) -> Proposal:
+        _ = (seed, max_tokens)
+        spec_key = getattr(task, "spec_hash", None)
+        if callable(spec_key):
+            spec_key = spec_key()
+        if not isinstance(spec_key, str) or not spec_key:
+            spec_key = spec_signature
+        match = self.index.get((domain, spec_key))
+        if match:
+            candidate_program = match.get("candidate_program", "")
+            metadata = {
+                "kind": "retrieval",
+                "dataset_hash": self.dataset_hash,
+                "match_type": "exact",
+            }
+            return Proposal.build(
+                candidate_program, "retrieval", metadata=metadata, error_atom=None
+            )
+        candidate_program = self._fallback_program(task)
+        metadata = {
+            "kind": "retrieval",
+            "dataset_hash": self.dataset_hash,
+            "match_type": "none",
+        }
+        if not candidate_program:
+            return Proposal.build(
+                "", "retrieval", metadata=metadata, error_atom="PROPOSER_MISSING"
+            )
+        return Proposal.build(candidate_program, "retrieval", metadata=metadata)

@@ -55,6 +55,18 @@ class Task(BaseModel):
         }
         return stable_hash(payload)
 
+    def spec_hash(self) -> str:
+        payload = {
+            "task_type": self.task_type,
+            "goal": self.goal,
+            "inputs": self.inputs,
+            "output": self.output,
+            "bounds": self.bounds,
+            "examples": [example.model_dump() for example in self.examples],
+            "metadata": self.metadata,
+        }
+        return stable_hash(payload)
+
     def io_schema_hash(self) -> str:
         payload = {"inputs": self.inputs, "output": self.output}
         return stable_hash(payload)

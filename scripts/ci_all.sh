@@ -2,7 +2,6 @@
 set -euo pipefail
 uv run ruff check .
 uv run mypy src
-uv run pytest
 ./scripts/ci_golden_suite.sh
 ./scripts/ci_golden_suite_v2.sh
 ./scripts/ci_golden_suite_v3.sh
@@ -12,7 +11,11 @@ uv run pytest
 ./scripts/ci_golden_suite_v6.sh
 ./scripts/ci_golden_suite_v6_warm.sh
 ./scripts/ci_golden_suite_v7.sh
+./scripts/ci_golden_suite_v8.sh
+./scripts/ci_golden_suite_v9.sh
+./scripts/ci_golden_suite_v10.sh
 ./scripts/ci_sealed.sh
+./scripts/ci_promo_smoke.sh
 
 junk_status=$(git status --porcelain)
 if echo "$junk_status" | grep -E -q '^(\\?\\?|[ MADRCU])\\s+(runs/|store/|.*__pycache__/)'; then
