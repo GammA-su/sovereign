@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -8,7 +10,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 import orjson
 
 from .orchestrator.task import Task
-from .utils import canonical_dumps, hash_bytes, read_json, to_jsonable
+from .utils import canonical_dumps, hash_bytes, read_json, to_jsonable, write_jsonl_line
 
 
 def _normalize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -141,9 +143,43 @@ class ReplayProposer:
         indexed: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for record in records:
             task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            spec_hash = record.get("spec_hash")
             spec_signature = record.get("spec_signature")
-            if isinstance(task_id, str) and isinstance(spec_signature, str):
-                indexed[(task_id, spec_signature)] = record
+            candidate_program = record.get("candidate_program")
+            proposer_id = record.get("proposer_id", "replay")
+            metadata = record.get("metadata", {})
+            error_atom = record.get("error_atom")
+            if isinstance(error_atom, str) and not error_atom:
+                error_atom = None
+            output = record.get("output")
+            if (not isinstance(candidate_program, str) or not candidate_program) and isinstance(
+                output, dict
+            ):
+                if output.get("ok") is True:
+                    candidate_program = output.get("program_text")
+                    metadata = output.get("metadata", {})
+                    error_atom = None
+                else:
+                    output_error = output.get("error_atom") or error_atom
+                    if not isinstance(output_error, str) or not output_error:
+                        output_error = "PROPOSER_MISSING"
+                    error_atom = output_error
+                    candidate_program = ""
+            entry: Dict[str, Any] = {
+                "candidate_program": (
+                    candidate_program if isinstance(candidate_program, str) else ""
+                ),
+                "proposer_id": proposer_id if isinstance(proposer_id, str) else "replay",
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
+            if isinstance(error_atom, str) and error_atom:
+                entry["error_atom"] = error_atom
+            if isinstance(spec_hash, str) and spec_hash:
+                indexed[(task_id, spec_hash)] = entry
+            if isinstance(spec_signature, str) and spec_signature:
+                indexed[(task_id, spec_signature)] = entry
         return indexed
 
     def propose(
@@ -156,16 +192,31 @@ class ReplayProposer:
         max_tokens: Optional[int] = None,
     ) -> Proposal:
         _ = (domain, seed, max_tokens)
-        record = self.records.get((task.task_id, spec_signature))
+        spec_hash = None
+        if hasattr(task, "spec_hash"):
+            try:
+                spec_hash = task.spec_hash()
+            except Exception:
+                spec_hash = None
+        record = None
+        if isinstance(spec_hash, str) and spec_hash:
+            record = self.records.get((task.task_id, spec_hash))
+        if record is None:
+            record = self.records.get((task.task_id, spec_signature))
         if not record:
             return Proposal.build("", "replay", metadata={}, error_atom="PROPOSER_MISSING")
         candidate_program = record.get("candidate_program")
-        if not isinstance(candidate_program, str):
-            return Proposal.build("", "replay", metadata={}, error_atom="PROPOSER_MISSING")
+        error_atom = record.get("error_atom")
+        if not isinstance(candidate_program, str) or not candidate_program:
+            if not isinstance(error_atom, str) or not error_atom:
+                error_atom = "PROPOSER_MISSING"
+            return Proposal.build("", "replay", metadata={}, error_atom=error_atom)
         proposer_id = record.get("proposer_id", "replay")
         if not isinstance(proposer_id, str):
             proposer_id = "replay"
         metadata = record.get("metadata", {})
+        if isinstance(error_atom, str) and error_atom:
+            return Proposal.build("", proposer_id, metadata=metadata, error_atom=error_atom)
         return Proposal.build(candidate_program, proposer_id, metadata=metadata)
 
 
@@ -173,14 +224,57 @@ class SubprocessProposer:
     def __init__(self, command: List[str], timeout_s: float = 15.0) -> None:
         self.command = list(command)
         self.timeout_s = timeout_s
+        self.context: Dict[str, Any] = {}
+        self.log_path: Optional[Path] = None
 
-    def _error(self, reason: str) -> Proposal:
+    def set_context(self, context: Dict[str, Any], log_path: Optional[Path]) -> None:
+        self.context = dict(context)
+        self.log_path = Path(log_path) if log_path else None
+
+    def _error(self) -> Proposal:
         return Proposal.build(
             "",
             "subprocess",
-            metadata={"reason": reason},
-            error_atom=f"PROPOSER_ERROR:{reason}",
+            metadata={},
+            error_atom="EXCEPTION:PROPOSER_SUBPROCESS_FAILED",
         )
+
+    def _log_call(
+        self,
+        *,
+        task_id: str,
+        domain: str,
+        spec_hash: str,
+        input_payload: Dict[str, Any],
+        output_payload: Dict[str, Any],
+        error_atom: Optional[str],
+        exit_code: Optional[int] = None,
+        stderr_tail: Optional[str] = None,
+    ) -> None:
+        if not self.log_path:
+            return
+        if "seed_program" in input_payload:
+            input_payload = dict(input_payload)
+            input_payload["seed_program_hash"] = hash_bytes(
+                input_payload["seed_program"].encode("utf-8")
+            )
+            input_payload.pop("seed_program", None)
+        input_hash = hash_bytes(canonical_dumps(input_payload))
+        output_hash = hash_bytes(canonical_dumps(output_payload))
+        record: Dict[str, Any] = {
+            "task_id": task_id,
+            "domain": domain,
+            "spec_hash": spec_hash,
+            "input_hash": input_hash,
+            "output_hash": output_hash,
+            "error_atom": error_atom or "",
+            "output": output_payload,
+        }
+        if exit_code is not None:
+            record["proposer_exit_code"] = int(exit_code)
+        if stderr_tail:
+            record["proposer_stderr_tail"] = stderr_tail
+        write_jsonl_line(self.log_path, record)
 
     def propose(
         self,
@@ -191,38 +285,183 @@ class SubprocessProposer:
         seed: int,
         max_tokens: Optional[int] = None,
     ) -> Proposal:
+        _ = (seed, max_tokens, spec_signature)
+        suite_id = str(self.context.get("suite_id", ""))
+        spec_hash = str(self.context.get("spec_hash") or task.spec_hash())
+        task_spec = self.context.get("task_spec") or task.open_view()
+        prior_best_hash = str(self.context.get("prior_best_hash", ""))
+        dataset_paths = self.context.get("dataset_paths", {})
         payload = {
-            "task": task.model_dump(),
+            "suite_id": suite_id,
+            "task_id": task.task_id,
             "domain": domain,
-            "spec_signature": spec_signature,
-            "seed": seed,
-            "max_tokens": max_tokens,
+            "spec_hash": spec_hash,
+            "task_spec": task_spec,
+            "prior_best_hash": prior_best_hash,
         }
+        seed_program = self.context.get("seed_program")
+        seed_program_hash = self.context.get("seed_program_hash")
+        if isinstance(seed_program, str) and seed_program:
+            payload["seed_program"] = seed_program
+        if isinstance(seed_program_hash, str) and seed_program_hash:
+            payload["seed_program_hash"] = seed_program_hash
+        if isinstance(dataset_paths, dict) and dataset_paths:
+            payload["dataset_paths"] = dict(dataset_paths)
         try:
-            result = subprocess.run(
-                self.command,
-                input=canonical_dumps(payload),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=self.timeout_s,
-                check=False,
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                env = {
+                    "PATH": os.environ.get("PATH", ""),
+                    "PYTHONHASHSEED": "0",
+                    "LC_ALL": "C",
+                    "LANG": "C",
+                }
+                result = subprocess.run(
+                    self.command,
+                    input=canonical_dumps(payload),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=self.timeout_s,
+                    check=False,
+                    cwd=tmp_dir,
+                    env=env,
+                )
+        except subprocess.TimeoutExpired as exc:
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            stderr_tail = (exc.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                stderr_tail=stderr_tail,
             )
-        except subprocess.TimeoutExpired:
-            return self._error("timeout")
+            return self._error()
         except Exception:
-            return self._error("spawn_failed")
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+            )
+            return self._error()
         if result.returncode != 0:
-            return self._error("nonzero")
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            stderr_tail = (result.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                exit_code=result.returncode,
+                stderr_tail=stderr_tail,
+            )
+            return self._error()
         try:
             output = orjson.loads(result.stdout or b"{}")
         except orjson.JSONDecodeError:
-            return self._error("bad_json")
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            stderr_tail = (result.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                exit_code=result.returncode,
+                stderr_tail=stderr_tail,
+            )
+            return self._error()
         if not isinstance(output, dict):
-            return self._error("bad_json")
-        candidate_program = output.get("candidate_program")
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            stderr_tail = (result.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                exit_code=result.returncode,
+                stderr_tail=stderr_tail,
+            )
+            return self._error()
+        if output.get("ok") is not True:
+            raw_error_atom = output.get("error_atom")
+            if isinstance(raw_error_atom, str) and raw_error_atom:
+                error_atom = raw_error_atom
+            else:
+                error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {
+                "ok": False,
+                "error_atom": error_atom,
+            }
+            stderr_tail = (result.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                exit_code=result.returncode,
+                stderr_tail=stderr_tail,
+            )
+            return Proposal.build("", "subprocess", metadata={}, error_atom=error_atom)
+        candidate_program = output.get("program_text")
         if not isinstance(candidate_program, str):
-            return self._error("missing_candidate")
+            error_atom = "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
+            output_payload = {"ok": False, "error_atom": error_atom}
+            stderr_tail = (result.stderr or b"")[-4000:].decode("utf-8", errors="replace")
+            if stderr_tail:
+                stderr_tail = stderr_tail.replace("\r\n", "\n").replace("\r", "\n")
+            self._log_call(
+                task_id=task.task_id,
+                domain=domain,
+                spec_hash=spec_hash,
+                input_payload=payload,
+                output_payload=output_payload,
+                error_atom=error_atom,
+                exit_code=result.returncode,
+                stderr_tail=stderr_tail,
+            )
+            return self._error()
         metadata = output.get("metadata", {})
+        output_payload = {
+            "ok": True,
+            "program_text": candidate_program,
+            "metadata": to_jsonable(metadata),
+        }
+        self._log_call(
+            task_id=task.task_id,
+            domain=domain,
+            spec_hash=spec_hash,
+            input_payload=payload,
+            output_payload=output_payload,
+            error_atom=None,
+        )
         return Proposal.build(candidate_program, "subprocess", metadata=metadata)
 
 

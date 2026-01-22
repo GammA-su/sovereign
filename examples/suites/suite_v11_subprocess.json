@@ -1,0 +1,9 @@
+{
+  "suite_id": "suite_v11_subprocess",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/codepatch_pass_01.json"},
+    {"task_file": "examples/tasks/jsonspec_pass_01.json"},
+    {"task_file": "examples/tasks/pyfunc_fail_01.json"}
+  ]
+}

@@ -459,3 +459,70 @@ def promote_artifact(
         admitted_by_run_id=admitted_by_run_id,
         metadata=entry,
     )
+
+
+def commit_best(
+    store_dir: Path,
+    *,
+    domain: str,
+    program_hash: str,
+    artifact_path: Path,
+    spec_hash: str,
+    tier: str,
+    lane_id: str,
+    meta_families: Sequence[str],
+    score_scaled: int,
+    breaker_attempts: int,
+    admitted_by_run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    store_dir = Path(store_dir)
+    tier = _normalize_tier(tier)
+    families_mode = "sealed" if tier == "sealed" else "public"
+    index = load_index(store_dir / "index.json")
+    entries = index.get("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+    key = make_key(
+        domain=domain,
+        spec_hash=spec_hash,
+        lane_id=lane_id,
+        families_mode=families_mode,
+        meta_families=meta_families,
+    )
+    existing_entry = entries.get(key)
+    existing_hash = ""
+    if isinstance(existing_entry, dict):
+        existing_hash = str(existing_entry.get("program_hash", ""))
+    if existing_hash == program_hash:
+        return {"written": False, "upgraded": False, "entry": existing_entry or {}}
+    score_key = [int(score_scaled), -int(breaker_attempts)]
+    existing_key = _coerce_score_key(existing_entry) if isinstance(existing_entry, dict) else None
+    if existing_key is not None and tuple(score_key) <= existing_key:
+        return {"written": False, "upgraded": False, "entry": existing_entry or {}}
+    entry = promote_artifact(
+        store_dir,
+        domain=domain,
+        program_hash=program_hash,
+        artifact_path=artifact_path,
+        spec_hash=spec_hash,
+        lane_id=lane_id,
+        families_mode=families_mode,
+        meta_families=meta_families,
+        score={"score_scaled": int(score_scaled)},
+        score_key=score_key,
+        score_scaled=int(score_scaled),
+        admitted_by_run_id=admitted_by_run_id,
+    )
+    written = entry.get("program_hash") == program_hash
+    upgraded = False
+    if written and tier == "sealed":
+        public_key = make_key(
+            domain=domain,
+            spec_hash=spec_hash,
+            lane_id=lane_id,
+            families_mode="public",
+            meta_families=meta_families,
+        )
+        public_entry = entries.get(public_key)
+        upgraded = isinstance(public_entry, dict) and bool(public_entry)
+    return {"written": bool(written), "upgraded": bool(upgraded), "entry": entry}

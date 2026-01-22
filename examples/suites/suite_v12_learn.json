@@ -1,0 +1,11 @@
+{
+  "suite_id": "suite_v12_learn",
+  "tasks": [
+    {"task_file": "examples/tasks/pyfunc_fail_01.json"},
+    {"task_file": "examples/tasks/jsonspec_fail_01.json"},
+    {"task_file": "examples/tasks/codepatch_fail_01.json"},
+    {"task_file": "examples/tasks/pyfunc_01.json"},
+    {"task_file": "examples/tasks/jsonspec_pass_01.json"},
+    {"task_file": "examples/tasks/codepatch_pass_01.json"}
+  ]
+}

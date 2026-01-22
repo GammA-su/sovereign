@@ -39,7 +39,13 @@ def test_replay_proposer_determinism(tmp_path: Path) -> None:
         proposer=proposer,
     )
     record = read_json(run_a / "proposer.json")
-    record.update({"task_id": task.task_id, "spec_signature": task.spec_signature()})
+    record.update(
+        {
+            "task_id": task.task_id,
+            "spec_signature": task.spec_signature(),
+            "spec_hash": task.spec_hash(),
+        }
+    )
     replay_path = tmp_path / "replay.json"
     write_json(replay_path, [record])
 
@@ -70,7 +76,7 @@ def test_proposer_failure(tmp_path: Path) -> None:
     )
     assert summary["verdict"] == "FAIL"
     proposer_record = read_json(run_dir / "proposer.json")
-    assert proposer_record["error_atom"].startswith("PROPOSER_ERROR:")
+    assert proposer_record["error_atom"] == "EXCEPTION:PROPOSER_SUBPROCESS_FAILED"
     decision = read_json(run_dir / "forge" / "decision.json")
     assert decision["decision"] == "REJECT"
     assert decision["reason"] == "proposer_failed"
@@ -79,4 +85,4 @@ def test_proposer_failure(tmp_path: Path) -> None:
     capsule_paths = sorted((run_dir / "capsules").glob("failure_*.json"))
     assert capsule_paths
     capsule = read_json(capsule_paths[0])
-    assert any(atom.startswith("PROPOSER_ERROR:") for atom in capsule["failure_atoms"])
+    assert "EXCEPTION:PROPOSER_SUBPROCESS_FAILED" in capsule["failure_atoms"]

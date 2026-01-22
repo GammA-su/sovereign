@@ -40,7 +40,7 @@ from ..promotion_store import (
     get_best_for_tier,
     promote_artifact,
 )
-from ..proposer_api import BaseProposer, Proposal
+from ..proposer_api import BaseProposer, Proposal, SubprocessProposer
 from ..pyfunc.minimize import MinimizedProgram, minimize_pyfunc_failure
 from ..pyfunc.program import PYEXEC_INTERPRETER_HASH, PyFuncProgram, compute_pyfunc_hash
 from ..schemas import UCR, BGRevisionOp, VerifierVerdict, WitnessPacket
@@ -52,6 +52,7 @@ from ..utils import (
     read_jsonl,
     stable_hash,
     write_json,
+    write_jsonl_line,
 )
 from ..verify.lanes import VerifierContext
 from ..verify.verifier import required_lanes_passed, run_verifiers
@@ -368,11 +369,18 @@ def episode_run(
     }
     promotion_best_hash = ""
     promotion_best_tier = ""
+    proposer_seed_program_hash = ""
+    proposer_seed_source = "none"
+    program_changed: bool | None = None
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
     try:
         task = load_task(task_file)
+        expected_verdict = None
+        if settings.expected_verdict:
+            expected_verdict = str(settings.expected_verdict).upper()
+            task.metadata["expected_verdict"] = expected_verdict
         kernel = KernelStub()
         interpretations = kernel.propose_interpretations(task)
         chosen = kernel.choose_interpretation(task, interpretations)
@@ -614,6 +622,52 @@ def episode_run(
             proposer_output = proposer_stub.propose(proposer_input)
             proposal = _proposal_from_stub(proposer_output)
         else:
+            set_context = getattr(proposer, "set_context", None)
+            if callable(set_context):
+                dataset_paths: dict[str, str] = {}
+                if settings.dataset_train_path:
+                    dataset_paths["train"] = settings.dataset_train_path
+                if settings.dataset_val_path:
+                    dataset_paths["val"] = settings.dataset_val_path
+                seed_program = ""
+                seed_program_hash = ""
+                if settings.prefer_promotion_store and promotion_candidate:
+                    seed_program_hash = promotion_candidate[1]
+                    program = promotion_candidate[0]
+                    if isinstance(program, PyFuncProgram):
+                        seed_program = program.code
+                    elif isinstance(program, CodePatchProgram):
+                        seed_program = program.patch
+                    elif isinstance(program, JsonSpecProgram):
+                        seed_program = canonical_dumps(program.spec).decode("utf-8")
+                if seed_program and seed_program_hash:
+                    proposer_seed_program_hash = seed_program_hash
+                    proposer_seed_source = "promotion"
+                context = {
+                    "suite_id": settings.suite_id or "",
+                    "task_id": task.task_id,
+                    "domain": task.task_type,
+                    "spec_hash": spec_hash,
+                    "task_spec": task.open_view(),
+                    "prior_best_hash": promotion_best_hash,
+                }
+                task_id_lower = task.task_id.lower()
+                if "fail" in task_id_lower:
+                    context["prior_verdict"] = "FAIL"
+                else:
+                    context["prior_verdict"] = "PASS"
+                context_failure_atoms = task.metadata.get("failure_atoms", [])
+                if isinstance(context_failure_atoms, list):
+                    context["failure_atoms"] = [
+                        atom for atom in context_failure_atoms if isinstance(atom, str)
+                    ]
+                if seed_program and seed_program_hash:
+                    context["seed_program"] = seed_program
+                    context["seed_program_hash"] = seed_program_hash
+                if dataset_paths:
+                    context["dataset_paths"] = dataset_paths
+                log_path = Path(settings.proposer_log_path) if settings.proposer_log_path else None
+                set_context(context, log_path)
             proposal = proposer.propose(
                 task,
                 domain=task.task_type,
@@ -624,15 +678,15 @@ def episode_run(
 
         if proposer is not None and not proposal.error_atom:
             if not proposal.candidate_program:
-                proposal = proposal.with_error("PROPOSER_ERROR:missing_candidate")
+                proposal = proposal.with_error("NO_PROPOSAL")
             elif task.task_type == "jsonspec":
                 try:
                     parsed = orjson.loads(proposal.candidate_program)
                 except orjson.JSONDecodeError:
-                    proposal = proposal.with_error("PROPOSER_ERROR:invalid_candidate")
+                    proposal = proposal.with_error("PROPOSAL_PARSE_FAIL")
                 else:
                     if not isinstance(parsed, dict):
-                        proposal = proposal.with_error("PROPOSER_ERROR:invalid_candidate")
+                        proposal = proposal.with_error("PROPOSAL_PARSE_FAIL")
                     else:
                         external_jsonspec_spec = parsed
 
@@ -645,12 +699,28 @@ def episode_run(
             {
                 "task_id": task.task_id,
                 "spec_signature": spec_signature,
+                "spec_hash": spec_hash,
                 "domain": task.task_type,
             }
         )
         proposer_path = run_dir / "proposer.json"
         write_json(proposer_path, proposer_record)
         ledger.append("PROPOSER_RESULT", proposer_record)
+        if (
+            proposer is not None
+            and settings.proposer_log_path
+            and not isinstance(proposer, SubprocessProposer)
+        ):
+            log_record = {
+                "task_id": task.task_id,
+                "domain": task.task_type,
+                "spec_hash": spec_hash,
+                "proposer_id": proposer_record.get("proposer_id", ""),
+                "proposal_hash": proposer_record.get("proposal_hash", ""),
+                "candidate_program": proposer_record.get("candidate_program", ""),
+                "error_atom": proposer_record.get("error_atom", ""),
+            }
+            write_jsonl_line(Path(settings.proposer_log_path), log_record)
 
         if isinstance(proposal.metadata, dict) and proposal.metadata.get("kind") == "retrieval":
             reuse_attempted["retrieval_attempted"] = True
@@ -801,6 +871,8 @@ def episode_run(
                 start_synth = time.time_ns()
                 cegis_result = run_cegis(task, settings, rng_seed)
                 synth_cost = time.time_ns() - start_synth
+        if proposer_seed_program_hash and cegis_result is not None:
+            program_changed = cegis_result.ast_hash != proposer_seed_program_hash
 
         artifacts.append(
             artifact_store.write_json(
@@ -1177,7 +1249,7 @@ def episode_run(
                         "domain": task.task_type,
                     },
                 )
-                if settings.promotion_store:
+                if settings.promotion_store and settings.promotion_write_enabled:
                     promotion_store_dir = Path(settings.promotion_store)
                     promote_artifact(
                         promotion_store_dir,
@@ -1489,7 +1561,7 @@ def episode_run(
     promotion_attempted = bool(reuse_attempted.get("promotion_attempted"))
     promotion_used = reuse_source == "promotion"
 
-    return {
+    summary = {
         "run_id": run_dir.name,
         "task_id": task_id,
         "verdict": overall_verdict,
@@ -1516,6 +1588,9 @@ def episode_run(
         "reuse_source": reuse_source,
         "reuse_attempted": reuse_attempted,
         "reuse_reject_reason_atoms": reuse_reject_reason_atoms,
+        "proposer_error_atom": proposer_record.get("error_atom", ""),
+        "proposer_seed_program_hash": proposer_seed_program_hash,
+        "proposer_seed_source": proposer_seed_source,
         "synth_ns": synth_cost,
         "verify_ns": verify_cost,
         "breaker_ns": breaker_cost,
@@ -1523,3 +1598,13 @@ def episode_run(
         "meta_cases": meta_cases,
         "failure_reason": failure_reason,
     }
+    if settings.expected_verdict:
+        expected = str(settings.expected_verdict).upper()
+        verdict_matches = overall_verdict == expected
+        summary["expected_verdict"] = expected
+        summary["verdict_matches_expected"] = verdict_matches
+        if not verdict_matches:
+            summary["expectation_mismatch_atoms"] = ["EXPECTATION_MISMATCH"]
+    if program_changed is not None:
+        summary["program_changed"] = program_changed
+    return summary

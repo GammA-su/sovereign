@@ -1,0 +1,17 @@
+{
+  "suite_id": "sealed_v4_learn",
+  "tasks": [
+    {
+      "task_file": "examples/tasks/pyfunc_01.json",
+      "expected_verdict": "PASS"
+    },
+    {
+      "task_file": "examples/tasks/codepatch_pass_01.json",
+      "expected_verdict": "PASS"
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_pass_01.json",
+      "expected_verdict": "PASS"
+    }
+  ]
+}

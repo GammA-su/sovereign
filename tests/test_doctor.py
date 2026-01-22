@@ -39,6 +39,12 @@ def test_doctor_reports_missing_in_fake_repo(tmp_path: Path) -> None:
     assert (
         "missing_baseline:examples/baselines/suite_v10.report.norm.json" in missing
     )
+    assert "missing_suite:examples/suites/suite_v11_subprocess.json" in missing
+    assert (
+        "missing_baseline:examples/baselines/suite_v11_subprocess.report.norm.json"
+        in missing
+    )
+    assert "missing_suite:examples/suites/suite_v12_learn.json" in missing
     assert (
         "missing_baseline:examples/baselines/suite_v8_replay.report.norm.json" in missing
     )
@@ -47,9 +53,11 @@ def test_doctor_reports_missing_in_fake_repo(tmp_path: Path) -> None:
     assert "missing_script:scripts/ci_golden_suite_v10.sh" in missing
     assert "missing_script:scripts/ci_golden_suite_v8_replay.sh" in missing
     assert "missing_script:scripts/ci_promo_smoke.sh" in missing
+    assert "missing_script:scripts/ci_golden_suite_v11_subprocess.sh" in missing
     assert "ci_all_missing_ref:scripts/ci_promo_smoke.sh" in missing
     assert "ci_all_missing_ref:scripts/ci_golden_suite_v9.sh" in missing
     assert "ci_all_missing_ref:scripts/ci_golden_suite_v10.sh" in missing
+    assert "ci_all_missing_ref:scripts/ci_golden_suite_v11_subprocess.sh" in missing
     assert "missing_sealed_seed" in missing
     assert "missing_gitignore:promoted_store/" in missing
 

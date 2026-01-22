@@ -38,9 +38,15 @@ class Settings(BaseSettings):
     prefer_promotion_store: bool = False
     prefer_promotion_tier: str = "sealed"
     promotion_tier_strict: bool = False
+    promotion_write_enabled: bool = True
     retrieval_dataset: Optional[str] = None
     pyfunc_minimize_budget: int = 50
     is_sealed_run: bool = False
+    suite_id: Optional[str] = None
+    dataset_train_path: Optional[str] = None
+    dataset_val_path: Optional[str] = None
+    proposer_log_path: Optional[str] = None
+    expected_verdict: Optional[str] = None
 
     def seed_for(self, run_id: str) -> int:
         digest = stable_hash({"run_id": run_id, "seed": self.open_seed})

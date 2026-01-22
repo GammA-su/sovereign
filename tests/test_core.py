@@ -977,18 +977,20 @@ def test_domain_warm_start_reuse(tmp_path: Path) -> None:
     )
 
     assert summary["verdict"] == "PASS"
-    assert summary["warm_start_store"]
-    assert summary["synth_ns"] == 0
+    assert summary["warm_start_store"] is False
+    assert summary["warm_start_candidate_rejected"] is True
+    assert summary["warm_start_reject_reason_atoms"] == ["SPEC_MISMATCH"]
+    assert summary["synth_ns"] > 0
     assert summary["warm_start_candidate_hash"] == arith_hash
-    assert not summary["warm_start_candidate_rejected"]
+    assert summary["warm_start_candidate_rejected"]
     actual_run = run_dir.parent / summary["run_id"]
     ucr = read_json(actual_run / "ucr.json")
     meta = ucr.get("run_metadata", {})
-    assert meta.get("warm_start_mode") == "domain_fallback"
-    assert meta.get("warm_start_reason") == "DOMAIN_FALLBACK"
+    assert meta.get("warm_start_mode") == "none"
+    assert meta.get("warm_start_reason") == "NO_MATCH"
     assert meta.get("warm_start_provided") is True
-    assert meta.get("warm_start_used") is True
-    assert meta.get("warm_start_fallback_used") is True
+    assert meta.get("warm_start_used") is False
+    assert meta.get("warm_start_fallback_used") is False
 
 
 def test_store_audit_cmd(tmp_path: Path) -> None:
@@ -1114,12 +1116,14 @@ def test_suite_warm_start_store_persists(tmp_path: Path) -> None:
     arith_entry = next(
         entry for entry in report_b["per_task"] if entry["task_id"] == "arith_02"
     )
-    assert arith_entry["warm_start_store"]
+    assert arith_entry["warm_start_store"] is False
+    assert arith_entry["warm_start_candidate_rejected"] is True
+    assert arith_entry["warm_start_reject_reason_atoms"] == ["SPEC_MISMATCH"]
     assert arith_entry["warm_start_provided"]
-    assert arith_entry["synth_ns"] == 0
+    assert arith_entry["synth_ns"] > 0
     candidate_hash = arith_entry["warm_start_candidate_hash"]
     assert candidate_hash
-    assert not arith_entry.get("warm_start_candidate_rejected", False)
+    assert arith_entry.get("warm_start_candidate_rejected", False)
     manifest_b = read_json(out_b / "store" / "manifest.json")
     assert candidate_hash in manifest_b.get("programs", {})
     warm_store_file = out_b / "store" / "arith" / f"{candidate_hash}.json"

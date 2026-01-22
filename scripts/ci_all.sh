@@ -14,8 +14,10 @@ uv run mypy src
 ./scripts/ci_golden_suite_v8.sh
 ./scripts/ci_golden_suite_v9.sh
 ./scripts/ci_golden_suite_v10.sh
+./scripts/ci_golden_suite_v11_subprocess.sh
 ./scripts/ci_sealed.sh
 ./scripts/ci_promo_smoke.sh
+./scripts/ci_learn_loop_smoke.sh
 
 junk_status=$(git status --porcelain)
 if echo "$junk_status" | grep -E -q '^(\\?\\?|[ MADRCU])\\s+(runs/|store/|.*__pycache__/)'; then

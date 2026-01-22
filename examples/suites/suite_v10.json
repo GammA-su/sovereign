@@ -11,7 +11,8 @@
     },
     {
       "task_file": "examples/tasks/pyfunc_meta_fail_01.json",
-      "overrides": {"policy_version": "v3"}
+      "overrides": {"policy_version": "v3"},
+      "expected_verdict": "FAIL"
     },
     {
       "task_file": "examples/tasks/codepatch_pass_01.json",
@@ -35,7 +36,8 @@
     },
     {
       "task_file": "examples/tasks/jsonspec_meta_fail_01.json",
-      "overrides": {"policy_version": "v3"}
+      "overrides": {"policy_version": "v3"},
+      "expected_verdict": "FAIL"
     },
     {
       "task_file": "examples/tasks/jsonspec_sealed_trap_01.json",
