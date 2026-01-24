@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -97,6 +98,8 @@ def test_learn_loop_multi_iter_history(tmp_path: Path) -> None:
             audit_report = audit_store(phase_dir / "store")
             assert audit_report["ok"] is True
     iter_summary = read_json(out_dir / "iter001_summary.json")
+    if not (iter_summary["promotion_upgrades"] >= 1):
+        print(f"DEBUG: iter001_summary={json.dumps(iter_summary, indent=2)}")
     assert iter_summary["promotion_writes_public"] >= 0
     assert iter_summary["promotion_writes_sealed"] >= 0
     assert iter_summary["promotion_upgrades"] >= 1

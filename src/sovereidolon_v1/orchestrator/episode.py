@@ -58,8 +58,8 @@ from ..verify.lanes import VerifierContext
 from ..verify.verifier import required_lanes_passed, run_verifiers
 from .kernel import KernelStub
 from .proposer import ProposerBudget, ProposerInput, ProposerOutput, ProposerStub, StoreCandidate
-from .specs import task_spec
-from .task import Task, load_task
+from .specs import TaskSpec, task_spec
+from .task import Example, Task, load_task
 
 
 class ContradictoryExamplesError(RuntimeError):
@@ -81,6 +81,180 @@ def _proposal_from_stub(output: ProposerOutput) -> Proposal:
         candidate_program = canonical_dumps(program.spec).decode("utf-8")
     metadata = output.report()
     return Proposal.build(candidate_program, "stub", metadata=metadata)
+
+
+def _extend_meta_families(meta: Dict[str, Any], extra: List[str]) -> None:
+    existing = meta.get("metamorphic", [])
+    cleaned = [name for name in existing if isinstance(name, str) and name]
+    merged = sorted(set(cleaned + [name for name in extra if name]))
+    if merged:
+        meta["metamorphic"] = merged
+
+
+def _apply_withheld_v1_metadata(task: Task) -> None:
+    if task.task_type == "pyfunc":
+        pyfunc_meta = task.metadata.setdefault("pyfunc", {})
+        _extend_meta_families(pyfunc_meta, ["duplicate_inputs", "permute_examples"])
+    elif task.task_type == "jsonspec":
+        jsonspec_meta = task.metadata.setdefault("jsonspec", {})
+        _extend_meta_families(
+            jsonspec_meta, ["key_order_invariance", "whitespace_invariance"]
+        )
+    elif task.task_type == "codepatch":
+        codepatch_meta = task.metadata.setdefault("codepatch", {})
+        _extend_meta_families(codepatch_meta, ["whitespace_idempotent"])
+
+
+def _apply_withheld_v2_metadata(task: Task) -> None:
+    _apply_withheld_v1_metadata(task)
+    if task.task_type == "pyfunc":
+        pyfunc_meta = task.metadata.setdefault("pyfunc", {})
+        _extend_meta_families(pyfunc_meta, ["reverse_args"])
+    elif task.task_type == "codepatch":
+        codepatch_meta = task.metadata.setdefault("codepatch", {})
+        _extend_meta_families(codepatch_meta, ["minimal_diff"])
+
+
+def _withheld_v1_pyfunc_tests(
+    task: Task, spec: TaskSpec, tests: List[Example]
+) -> List[Example]:
+    if not tests:
+        return []
+    base_inputs = dict(tests[0].inputs)
+    derived: List[Example] = []
+    variants = [0, -1]
+    for first_val in variants:
+        inputs: Dict[str, Any] = {}
+        for name, type_name in task.inputs.items():
+            base_val = base_inputs.get(name)
+            if type_name == "Int":
+                inputs[name] = first_val
+            elif type_name == "Bool":
+                inputs[name] = False if first_val == 0 else True
+            elif type_name == "List":
+                inputs[name] = [] if first_val == 0 else list(base_val or [])
+            else:
+                inputs[name] = base_val
+        if inputs == base_inputs:
+            continue
+        try:
+            expected = spec.evaluate(inputs)
+        except Exception:
+            continue
+        derived.append(Example(inputs=inputs, output=expected))
+        if len(derived) >= 2:
+            break
+    return derived
+
+
+def _withheld_v2_pyfunc_tests(
+    task: Task, spec: TaskSpec, tests: List[Example]
+) -> List[Example]:
+    derived = list(_withheld_v1_pyfunc_tests(task, spec, tests))
+    if not tests:
+        return derived
+    inputs = dict(tests[0].inputs)
+    keys = list(inputs.keys())
+    if len(keys) == 2:
+        swapped = {keys[0]: inputs[keys[1]], keys[1]: inputs[keys[0]]}
+        if swapped != inputs:
+            try:
+                expected = spec.evaluate(swapped)
+            except Exception:
+                expected = None
+            if expected is not None:
+                derived.append(Example(inputs=swapped, output=expected))
+    return derived[:3]
+
+
+def _jsonspec_coerce_inputs(
+    inputs: Dict[str, Any]
+) -> tuple[str, Dict[str, Any] | None, bool]:
+    if len(inputs) != 1:
+        return "", None, False
+    key = next(iter(inputs))
+    raw = inputs[key]
+    if isinstance(raw, str):
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return key, None, True
+        if not isinstance(parsed, dict):
+            return key, None, True
+        return key, parsed, True
+    if isinstance(raw, dict):
+        return key, raw, False
+    return key, None, False
+
+
+def _jsonspec_format_value(value: Dict[str, Any], as_string: bool) -> Any:
+    if not as_string:
+        return value
+    return canonical_dumps(value).decode("utf-8")
+
+
+def _withheld_v1_jsonspec_tests(
+    task: Task, spec: TaskSpec, tests: List[Example]
+) -> List[Example]:
+    if not tests:
+        return []
+    key, parsed, was_string = _jsonspec_coerce_inputs(tests[0].inputs)
+    if not parsed or not key:
+        return []
+    derived: List[Example] = []
+    if len(parsed.keys()) >= 2:
+        reversed_keys = list(reversed(list(parsed.keys())))
+        permuted = {k: parsed[k] for k in reversed_keys}
+        derived_inputs = {key: _jsonspec_format_value(permuted, was_string)}
+        try:
+            expected = spec.evaluate(derived_inputs)
+            derived.append(Example(inputs=derived_inputs, output=expected))
+        except Exception:
+            pass
+    if "__withheld" not in parsed:
+        augmented = dict(parsed)
+        augmented["__withheld"] = 1
+        derived_inputs = {key: _jsonspec_format_value(augmented, was_string)}
+        try:
+            expected = spec.evaluate(derived_inputs)
+            derived.append(Example(inputs=derived_inputs, output=expected))
+        except Exception:
+            pass
+    return derived[:2]
+
+
+def _withheld_v2_jsonspec_tests(
+    task: Task, spec: TaskSpec, tests: List[Example]
+) -> List[Example]:
+    derived = list(_withheld_v1_jsonspec_tests(task, spec, tests))
+    if not tests:
+        return derived
+    key, parsed, _ = _jsonspec_coerce_inputs(tests[0].inputs)
+    if parsed and key:
+        compact = orjson.dumps(parsed, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+        derived_inputs = {key: compact}
+        try:
+            expected = spec.evaluate(derived_inputs)
+            derived.append(Example(inputs=derived_inputs, output=expected))
+        except Exception:
+            pass
+    return derived[:3]
+
+
+def _withheld_v1_tests(task: Task, spec: TaskSpec, tests: List[Example]) -> List[Example]:
+    if task.task_type == "pyfunc":
+        return _withheld_v1_pyfunc_tests(task, spec, tests)
+    if task.task_type == "jsonspec":
+        return _withheld_v1_jsonspec_tests(task, spec, tests)
+    return []
+
+
+def _withheld_v2_tests(task: Task, spec: TaskSpec, tests: List[Example]) -> List[Example]:
+    if task.task_type == "pyfunc":
+        return _withheld_v2_pyfunc_tests(task, spec, tests)
+    if task.task_type == "jsonspec":
+        return _withheld_v2_jsonspec_tests(task, spec, tests)
+    return []
 
 
 def _init_run_dirs(run_dir: Path) -> None:
@@ -372,6 +546,10 @@ def episode_run(
     proposer_seed_program_hash = ""
     proposer_seed_source = "none"
     program_changed: bool | None = None
+    proposer_kind = ""
+    repair_kind = ""
+    repair_edits_count = 0
+    failure_hint_used = 0
 
     artifact_store = ArtifactStore(run_dir / "artifacts", ledger)
 
@@ -395,6 +573,13 @@ def episode_run(
         spec_hash = task.spec_hash()
         reuse_attempted["warm_start_attempted"] = bool(settings.warm_start_store)
         reuse_attempted["promotion_attempted"] = bool(settings.prefer_promotion_store)
+        families_mode = str(settings.families_mode or "public").lower()
+        if families_mode == "public" and (task.sealed or settings.is_sealed_run):
+            families_mode = "sealed"
+        if families_mode == "withheld_v1":
+            _apply_withheld_v1_metadata(task)
+        elif families_mode == "withheld_v2":
+            _apply_withheld_v2_metadata(task)
         is_pyfunc = task.task_type == "pyfunc"
         is_codepatch = task.task_type == "codepatch"
         is_jsonspec = task.task_type == "jsonspec"
@@ -419,7 +604,6 @@ def episode_run(
             lane_id = "jsonspec_meta" if meta_required else "jsonspec_exec"
         else:
             lane_id = task.task_type
-        families_mode = "sealed" if task.sealed or settings.is_sealed_run else "public"
         promotion_candidate: tuple[Any, str] | None = None
         promotion_candidate_hash = ""
         promotion_candidate_tier = ""
@@ -664,6 +848,7 @@ def episode_run(
                 if seed_program and seed_program_hash:
                     context["seed_program"] = seed_program
                     context["seed_program_hash"] = seed_program_hash
+                    context["seed_source"] = proposer_seed_source
                 if dataset_paths:
                     context["dataset_paths"] = dataset_paths
                 log_path = Path(settings.proposer_log_path) if settings.proposer_log_path else None
@@ -675,6 +860,17 @@ def episode_run(
                 seed=settings.seed_for(run_dir.name),
                 max_tokens=None,
             )
+        proposer_kind = proposal.proposer_id
+        if isinstance(proposal.metadata, dict):
+            value = proposal.metadata.get("repair_kind")
+            if isinstance(value, str):
+                repair_kind = value
+            edits = proposal.metadata.get("repair_edits_count")
+            if isinstance(edits, (int, float)):
+                repair_edits_count = int(edits)
+            hint_used = proposal.metadata.get("failure_hint_used")
+            if isinstance(hint_used, (int, float, bool)):
+                failure_hint_used = int(hint_used)
 
         if proposer is not None and not proposal.error_atom:
             if not proposal.candidate_program:
@@ -943,10 +1139,19 @@ def episode_run(
                 )
 
             spec = task_spec(task)
+            tests_for_verifier = list(cegis_result.tests)
+            if families_mode == "withheld_v1":
+                withheld_tests = _withheld_v1_tests(task, spec, cegis_result.tests)
+                if withheld_tests:
+                    tests_for_verifier = tests_for_verifier + withheld_tests
+            elif families_mode == "withheld_v2":
+                withheld_tests = _withheld_v2_tests(task, spec, cegis_result.tests)
+                if withheld_tests:
+                    tests_for_verifier = tests_for_verifier + withheld_tests
             verifier_ctx = VerifierContext(
                 task=task,
                 program=cegis_result.program,
-                tests=cegis_result.tests,
+                tests=tests_for_verifier,
                 trace_hashes=cegis_result.trace_hashes,
                 run_dir=str(run_dir),
                 settings=settings,
@@ -1010,7 +1215,7 @@ def episode_run(
                 task=task,
                 program=cegis_result.program,
                 spec=spec,
-                tests=cegis_result.tests,
+                tests=tests_for_verifier,
                 budget=settings.break_budget_attempts,
                 seed=rng_seed + 99,
             )
@@ -1114,10 +1319,22 @@ def episode_run(
             coverage_atoms = sorted(
                 coverage_ledger._episode_atoms(task.task_type, verifier_payload, breaker_report)
             )
+            task_id_lower = task.task_id.lower()
+            ladder_atoms: list[str] = []
+            if "ladder_r2" in task_id_lower:
+                ladder_atoms = ["ladder:r1", "ladder:r2"]
+            elif "ladder_r1" in task_id_lower:
+                ladder_atoms = ["ladder:r1"]
+            if ladder_atoms:
+                coverage_atoms = sorted(set(coverage_atoms + ladder_atoms))
+                coverage_gain = len(coverage_atoms)
+            controller_families_mode = (
+                "sealed" if families_mode != "public" else "public"
+            )
             controller_context: Dict[str, Any] = {
                 "sealed_regression": sealed_regression,
                 "program_hash": cegis_result.ast_hash,
-                "families_mode": families_mode,
+                "families_mode": controller_families_mode,
                 "coverage_atoms": coverage_atoms,
                 "metamorphic_violation": metamorphic_violation,
                 "metamorphic_pass": metamorphic_pass,
@@ -1589,6 +1806,10 @@ def episode_run(
         "reuse_attempted": reuse_attempted,
         "reuse_reject_reason_atoms": reuse_reject_reason_atoms,
         "proposer_error_atom": proposer_record.get("error_atom", ""),
+        "proposer_kind": proposer_kind,
+        "repair_kind": repair_kind,
+        "repair_edits_count": repair_edits_count,
+        "failure_hint_used": failure_hint_used,
         "proposer_seed_program_hash": proposer_seed_program_hash,
         "proposer_seed_source": proposer_seed_source,
         "synth_ns": synth_cost,

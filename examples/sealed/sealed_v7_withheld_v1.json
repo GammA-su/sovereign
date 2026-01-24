@@ -1,0 +1,38 @@
+{
+  "suite_id": "sealed_v7_withheld_v1",
+  "families_mode": "withheld_v1",
+  "tasks": [
+    {
+      "task_file": "examples/tasks/pyfunc_01.json",
+      "expected_verdict": "PASS"
+    },
+    {
+      "task_file": "examples/tasks/pyfunc_fail_01.json",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "task_file": "examples/tasks/codepatch_pass_01.json",
+      "expected_verdict": "PASS"
+    },
+    {
+      "task_file": "examples/tasks/codepatch_fail_01.json",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_pass_01.json",
+      "expected_verdict": "PASS"
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_fail_01.json",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_sealed_trap_01.json",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_breaker_dups_01.json",
+      "expected_verdict": "PASS"
+    }
+  ]
+}

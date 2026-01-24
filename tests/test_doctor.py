@@ -45,6 +45,41 @@ def test_doctor_reports_missing_in_fake_repo(tmp_path: Path) -> None:
         in missing
     )
     assert "missing_suite:examples/suites/suite_v12_learn.json" in missing
+    assert "missing_suite:examples/suites/suite_v14_ladder.json" in missing
+    assert "missing_suite:examples/suites/suite_v15_scale_lite.json" in missing
+    assert "missing_suite:examples/suites/suite_v16_scale_medium.json" in missing
+    assert "missing_suite:examples/sealed/sealed_v6_ladder.json" in missing
+    assert "missing_suite:examples/sealed/sealed_v7_withheld_v1.json" in missing
+    assert "missing_suite:examples/sealed/sealed_v8_withheld_scale_lite.json" in missing
+    assert "missing_suite:examples/sealed/sealed_v9_withheld_scale_medium.json" in missing
+    assert (
+        "missing_baseline:examples/baselines/suite_v14_ladder.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/suite_v15_scale_lite.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/suite_v16_scale_medium.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/sealed_v6_ladder.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/sealed_v7_withheld_v1.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/sealed_v8_withheld_scale_lite.report.norm.json"
+        in missing
+    )
+    assert (
+        "missing_baseline:examples/baselines/sealed_v9_withheld_scale_medium.report.norm.json"
+        in missing
+    )
     assert (
         "missing_baseline:examples/baselines/suite_v8_replay.report.norm.json" in missing
     )

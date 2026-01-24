@@ -20,7 +20,7 @@ from hypothesis import settings as hypo_settings
 from hypothesis import strategies as st
 
 from ..bvps.interpreter import eval_program
-from ..codepatch.applier import apply_patch, parse_unified_diff
+from ..codepatch.applier import FilePatch, apply_patch, parse_unified_diff
 from ..codepatch.runner import default_test_command, run_codepatch, run_tests_in_dir
 from ..codepatch.validator import extract_patch_paths, validate_patch
 from ..config import Settings
@@ -333,7 +333,12 @@ def transfer_lane(ctx: VerifierContext) -> VerifierVerdict:
 PYTHON_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER_METAMORPHIC = {"commutative", "idempotent"}
 _DERIVED_METAMORPHIC = {"reverse_args", "duplicate_inputs", "permute_examples"}
-_CODEPATCH_METAMORPHIC = {"whitespace_idempotent", "apply_revert_apply", "commutation_safe"}
+_CODEPATCH_METAMORPHIC = {
+    "whitespace_idempotent",
+    "apply_revert_apply",
+    "commutation_safe",
+    "minimal_diff",
+}
 
 
 def _pyexec_env() -> dict[str, str]:
@@ -717,6 +722,40 @@ def _diff_patch(paths: List[str], from_root: Path, to_root: Path) -> str:
     return "\n".join(diff_lines) + "\n"
 
 
+def _minimal_diff_ok(
+    file_patch: FilePatch, original_root: Path, updated_root: Path
+) -> bool:
+    if file_patch.is_delete:
+        return False
+    original_path = original_root / file_patch.path
+    updated_path = updated_root / file_patch.path
+    if not original_path.exists():
+        return file_patch.is_new
+    if not updated_path.exists():
+        return False
+    original_lines = original_path.read_text(encoding="utf-8").splitlines()
+    updated_lines = updated_path.read_text(encoding="utf-8").splitlines()
+    if not file_patch.hunks:
+        return original_lines == updated_lines
+
+    def _strip_hunks(lines: List[str], use_new: bool) -> List[str]:
+        segments: List[str] = []
+        cursor = 0
+        for hunk in file_patch.hunks:
+            start = (hunk.new_start if use_new else hunk.old_start) - 1
+            count = hunk.new_count if use_new else hunk.old_count
+            if start < cursor:
+                start = cursor
+            segments.extend(lines[cursor:start])
+            cursor = start + max(0, count)
+        segments.extend(lines[cursor:])
+        return segments
+
+    return _strip_hunks(original_lines, use_new=False) == _strip_hunks(
+        updated_lines, use_new=True
+    )
+
+
 def _find_subsequence(lines: List[str], expected: List[str]) -> int:
     if not expected:
         return 0
@@ -901,6 +940,27 @@ def codepatch_metamorphic_lane(ctx: VerifierContext) -> VerifierVerdict:
                         family_failed = result.verdict != "PASS" or bool(
                             result.failure_atoms
                         )
+        elif family == "minimal_diff":
+            parsed = parse_unified_diff(patch_text)
+            if not parsed:
+                applicable = False
+            if applicable:
+                with tempfile.TemporaryDirectory() as workdir:
+                    fixture_root = Path(workdir) / "fixture"
+                    original_root = Path(workdir) / "original"
+                    shutil.copytree(fixture_path, fixture_root)
+                    shutil.copytree(fixture_path, original_root)
+                    applied, _ = apply_patch(patch_text, fixture_root)
+                    if not applied:
+                        family_failed = True
+                    else:
+                        tests_run += 1
+                        for file_patch in parsed:
+                            if not _minimal_diff_ok(
+                                file_patch, original_root, fixture_root
+                            ):
+                                family_failed = True
+                                break
 
         if not applicable:
             continue

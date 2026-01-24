@@ -72,7 +72,7 @@ def make_key(
     families_mode: str,
     meta_families: Sequence[str],
 ) -> str:
-    tier = "sealed" if families_mode == "sealed" else "public"
+    tier = _families_mode_to_tier(families_mode)
     return "|".join(
         [
             domain,
@@ -116,6 +116,13 @@ def _coerce_score_scaled(score: Mapping[str, Any], score_key: Sequence[int]) -> 
 def _normalize_tier(value: Any) -> str:
     tier = str(value or "").lower()
     if tier == "sealed":
+        return "sealed"
+    return "public"
+
+
+def _families_mode_to_tier(value: Any) -> str:
+    mode = str(value or "").lower()
+    if mode in {"sealed", "withheld_v1", "withheld_v2"}:
         return "sealed"
     return "public"
 
@@ -338,11 +345,11 @@ def find_spec_mismatch_candidate(
         return None
     prefer = str(prefer_tier or "sealed").lower()
     tier_order = ["sealed", "public"]
-    if families_mode == "sealed":
+    if _families_mode_to_tier(families_mode) == "sealed":
         tier_order = ["sealed"]
     elif prefer == "public":
         tier_order = ["public", "sealed"]
-    if prefer == "any" and families_mode != "sealed":
+    if prefer == "any" and _families_mode_to_tier(families_mode) != "sealed":
         selected = _select_best(mismatched)
         if selected is not None:
             selected["tier"] = _normalize_tier(selected.get("tier"))
@@ -429,7 +436,7 @@ def promote_artifact(
     relative_path = dest_path.relative_to(store_dir).as_posix()
 
     meta_profile_hash = compute_meta_profile_hash(meta_families)
-    tier = "sealed" if families_mode == "sealed" else "public"
+    tier = _families_mode_to_tier(families_mode)
     entry = {
         "domain": domain,
         "spec_hash": spec_hash,
@@ -474,6 +481,7 @@ def commit_best(
     score_scaled: int,
     breaker_attempts: int,
     admitted_by_run_id: Optional[str] = None,
+    allow_equal_score: bool = False,
 ) -> Dict[str, Any]:
     store_dir = Path(store_dir)
     tier = _normalize_tier(tier)
@@ -497,8 +505,11 @@ def commit_best(
         return {"written": False, "upgraded": False, "entry": existing_entry or {}}
     score_key = [int(score_scaled), -int(breaker_attempts)]
     existing_key = _coerce_score_key(existing_entry) if isinstance(existing_entry, dict) else None
-    if existing_key is not None and tuple(score_key) <= existing_key:
-        return {"written": False, "upgraded": False, "entry": existing_entry or {}}
+    if existing_key is not None:
+        if tuple(score_key) < existing_key:
+            return {"written": False, "upgraded": False, "entry": existing_entry or {}}
+        if tuple(score_key) == existing_key and not allow_equal_score:
+            return {"written": False, "upgraded": False, "entry": existing_entry or {}}
     entry = promote_artifact(
         store_dir,
         domain=domain,

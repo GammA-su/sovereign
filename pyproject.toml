@@ -45,6 +45,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+    "slow: long-running tests (set RUN_SLOW_TESTS=1 to include)",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]

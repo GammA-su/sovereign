@@ -28,6 +28,7 @@ from .proposer_api import (
     SubprocessProposer,
 )
 from .proposer_heuristic_v1 import HeuristicProposerV1
+from .proposer_retrieval_repair_v1 import RetrievalRepairProposerV1
 from .pyfunc.runner import PYEXEC_VERSION
 from .schemas import UCR, export_schemas
 from .store.audit import audit_store
@@ -207,6 +208,8 @@ def _build_proposer(
         if retrieval_dataset is None:
             raise typer.BadParameter("missing --retrieval-dataset for retrieval proposer")
         return RetrievalProposer(retrieval_dataset)
+    if proposer_kind == "retrieval_repair_v1":
+        return RetrievalRepairProposerV1()
     if proposer_kind == "heuristic_v1":
         return HeuristicProposerV1()
     if proposer_kind == "subprocess":
@@ -787,6 +790,27 @@ def doctor_cmd(
     suite_v12 = root / "examples" / "suites" / "suite_v12_learn.json"
     if not check_json(suite_v12, "suite"):
         suites_ok = False
+    suite_v14 = root / "examples" / "suites" / "suite_v14_ladder.json"
+    if not check_json(suite_v14, "suite"):
+        suites_ok = False
+    suite_v15 = root / "examples" / "suites" / "suite_v15_scale_lite.json"
+    if not check_json(suite_v15, "suite"):
+        suites_ok = False
+    suite_v16 = root / "examples" / "suites" / "suite_v16_scale_medium.json"
+    if not check_json(suite_v16, "suite"):
+        suites_ok = False
+    sealed_v6 = root / "examples" / "sealed" / "sealed_v6_ladder.json"
+    if not check_json(sealed_v6, "suite"):
+        suites_ok = False
+    sealed_v7 = root / "examples" / "sealed" / "sealed_v7_withheld_v1.json"
+    if not check_json(sealed_v7, "suite"):
+        suites_ok = False
+    sealed_v8 = root / "examples" / "sealed" / "sealed_v8_withheld_scale_lite.json"
+    if not check_json(sealed_v8, "suite"):
+        suites_ok = False
+    sealed_v9 = root / "examples" / "sealed" / "sealed_v9_withheld_scale_medium.json"
+    if not check_json(sealed_v9, "suite"):
+        suites_ok = False
     baseline_v11 = (
         root
         / "examples"
@@ -794,6 +818,62 @@ def doctor_cmd(
         / "suite_v11_subprocess.report.norm.json"
     )
     if not check_json(baseline_v11, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_v14 = (
+        root
+        / "examples"
+        / "baselines"
+        / "suite_v14_ladder.report.norm.json"
+    )
+    if not check_json(baseline_v14, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_v15 = (
+        root
+        / "examples"
+        / "baselines"
+        / "suite_v15_scale_lite.report.norm.json"
+    )
+    if not check_json(baseline_v15, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_v16 = (
+        root
+        / "examples"
+        / "baselines"
+        / "suite_v16_scale_medium.report.norm.json"
+    )
+    if not check_json(baseline_v16, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_sealed_v6 = (
+        root
+        / "examples"
+        / "baselines"
+        / "sealed_v6_ladder.report.norm.json"
+    )
+    if not check_json(baseline_sealed_v6, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_sealed_v7 = (
+        root
+        / "examples"
+        / "baselines"
+        / "sealed_v7_withheld_v1.report.norm.json"
+    )
+    if not check_json(baseline_sealed_v7, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_sealed_v8 = (
+        root
+        / "examples"
+        / "baselines"
+        / "sealed_v8_withheld_scale_lite.report.norm.json"
+    )
+    if not check_json(baseline_sealed_v8, "baseline", require_newline=True):
+        baselines_ok = False
+    baseline_sealed_v9 = (
+        root
+        / "examples"
+        / "baselines"
+        / "sealed_v9_withheld_scale_medium.report.norm.json"
+    )
+    if not check_json(baseline_sealed_v9, "baseline", require_newline=True):
         baselines_ok = False
     checks["suites"] = suites_ok
     checks["baselines"] = baselines_ok
@@ -973,6 +1053,9 @@ def _split_bucket(task_id: str) -> int:
 def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
     suite_data = read_json(suite_file)
     suite_id = suite_data.get("suite_id", suite_file.stem)
+    families_mode = suite_data.get("families_mode")
+    if not isinstance(families_mode, str) or not families_mode:
+        families_mode = "sealed"
     tasks = suite_data.get("tasks", [])
     per_task = {
         task.get("task_id"): task for task in report.get("per_task", []) if isinstance(task, dict)
@@ -1040,7 +1123,7 @@ def _sealed_summary(suite_file: Path, report: dict[str, Any]) -> dict[str, Any]:
         per_domain_kpi[domain] = averages
     return {
         "suite_id": suite_id,
-        "families_mode": "sealed",
+        "families_mode": families_mode,
         "totals": totals,
         "per_domain": per_domain,
         "per_domain_kpi_averages": per_domain_kpi,
@@ -1085,10 +1168,16 @@ def _phase_metrics(report: dict[str, Any]) -> dict[str, int]:
     fail_count = int(totals.get("fail", 0))
     breaker_attempts = int(totals.get("breaker_attempts", 0))
     coverage_new_atoms = int(totals.get("coverage_new_atoms", 0))
-    unexpected_fail = int(totals.get("unexpected_fail", 0))
-    unexpected_pass = int(totals.get("unexpected_pass", 0))
-    expected_fail = int(totals.get("expected_fail", 0))
-    expected_pass = int(totals.get("expected_pass", 0))
+    if "unexpected_fail" in totals:
+        unexpected_fail = int(totals.get("unexpected_fail", 0))
+        unexpected_pass = int(totals.get("unexpected_pass", 0))
+        expected_fail = int(totals.get("expected_fail", 0))
+        expected_pass = int(totals.get("expected_pass", 0))
+    else:
+        unexpected_fail = fail_count
+        unexpected_pass = 0
+        expected_fail = 0
+        expected_pass = pass_count
     promotion_attempted = 0
     promotion_used = 0
     score_sum = 0
@@ -1224,6 +1313,7 @@ def _commit_public_promotions(
         spec_hash = str(propose_entry.get("spec_hash", ""))
         if not domain or not spec_hash:
             continue
+        allow_equal = "ladder" in task_id
         result = commit_best(
             promotion_store,
             domain=domain,
@@ -1236,6 +1326,7 @@ def _commit_public_promotions(
             score_scaled=_entry_score_scaled(propose_entry),
             breaker_attempts=_entry_breaker_attempts(propose_entry),
             admitted_by_run_id=propose_dir.name,
+            allow_equal_score=allow_equal,
         )
         if result.get("written"):
             writes += 1
@@ -1423,6 +1514,9 @@ def suite_run_cmd(
 ) -> None:
     suite_data = read_json(suite_file)
     suite_id = suite_data.get("suite_id", suite_file.stem)
+    suite_families_mode = suite_data.get("families_mode")
+    if not isinstance(suite_families_mode, str) or not suite_families_mode:
+        suite_families_mode = None
     tasks = suite_data.get("tasks", [])
     expectation_tracking = any(
         isinstance(entry, dict) and "expected_verdict" in entry for entry in tasks
@@ -1487,6 +1581,10 @@ def suite_run_cmd(
             overrides["promotion_write_enabled"] = promotion_write_enabled
         if sealed_run and "is_sealed_run" not in overrides:
             overrides["is_sealed_run"] = True
+        if suite_families_mode and "families_mode" not in overrides:
+            overrides["families_mode"] = suite_families_mode
+        if sealed_run and "families_mode" not in overrides:
+            overrides["families_mode"] = "sealed"
         if "suite_id" not in overrides:
             overrides["suite_id"] = suite_id
         if expectation_tracking and "expected_verdict" not in overrides:
@@ -1653,6 +1751,17 @@ def suite_run_cmd(
         proposer_error = summary.get("proposer_error_atom", "")
         if proposer_error:
             task_entry["proposer_error_atom"] = proposer_error
+        proposer_kind = summary.get("proposer_kind", "")
+        if proposer_kind == "retrieval_repair_v1":
+            task_entry["proposer_kind"] = proposer_kind
+            repair_kind = summary.get("repair_kind", "")
+            task_entry["repair_kind"] = repair_kind if isinstance(repair_kind, str) else ""
+            repair_edits = summary.get("repair_edits_count", 0)
+            if isinstance(repair_edits, (int, float)):
+                task_entry["repair_edits_count"] = int(repair_edits)
+            failure_hint = summary.get("failure_hint_used", 0)
+            if isinstance(failure_hint, (int, float, bool)):
+                task_entry["failure_hint_used"] = int(failure_hint)
         seed_hash = summary.get("proposer_seed_program_hash", "")
         seed_source = summary.get("proposer_seed_source", "")
         if seed_source and seed_source != "none":
@@ -1874,7 +1983,7 @@ def suite_run_cmd(
         "store_updates": store_updates,
     }
     if sealed_run:
-        report["families_mode"] = "sealed"
+        report["families_mode"] = suite_families_mode or "sealed"
         report["is_sealed_run"] = True
     report_path = report_dir / "report.json"
     write_json(report_path, report)
@@ -1999,13 +2108,88 @@ def learn_loop_cmd(
     proposer_cmd: Optional[str] = PROPOSER_CMD_OPTION,
     proposer_timeout_s: float = PROPOSER_TIMEOUT_OPTION,
 ) -> None:
+    out_root = Path(out_dir)
     suite_file = suite_file or Path("examples/suites/suite_v10.json")
-    sealed_suite_file = sealed_suite_file or Path("examples/sealed/sealed_v3.json")
-    if not suite_file.exists():
+    resolved_suite_file = Path(suite_file).resolve()
+    if not resolved_suite_file.exists():
         raise typer.BadParameter(f"--suite-file not found: {suite_file}")
-    if not sealed_suite_file.exists():
+    if sealed_suite_file is None:
+        suite_name = resolved_suite_file.as_posix()
+        if "suite_v16_scale_medium" in suite_name:
+            sealed_suite_file = Path(
+                "examples/sealed/sealed_v9_withheld_scale_medium.json"
+            )
+        elif "suite_v15_scale_lite" in suite_name:
+            sealed_suite_file = Path(
+                "examples/sealed/sealed_v8_withheld_scale_lite.json"
+            )
+        else:
+            sealed_suite_file = Path("examples/sealed/sealed_v7_withheld_v1.json")
+    resolved_sealed_file = Path(sealed_suite_file).resolve()
+    if not resolved_sealed_file.exists():
         raise typer.BadParameter(f"--sealed-suite-file not found: {sealed_suite_file}")
-    ensure_dir(out_dir)
+    sealed_suite_data = read_json(resolved_sealed_file)
+    sealed_suite_id = sealed_suite_data.get("suite_id", sealed_suite_file.stem)
+    sealed_families_mode = sealed_suite_data.get("families_mode")
+    if not isinstance(sealed_families_mode, str) or not sealed_families_mode:
+        sealed_families_mode = "sealed"
+
+    def _write_dominance_summary(
+        loop_summary: dict[str, Any], loop_iterations: list[dict[str, Any]]
+    ) -> None:
+        dominance_iterations: list[dict[str, Any]] = []
+        for entry in loop_iterations:
+            if not isinstance(entry, dict):
+                continue
+            public = entry.get("public", {})
+            propose = entry.get("propose", {})
+            sealed = entry.get("sealed", {})
+            dominance_iterations.append(
+                {
+                    "iter": int(entry.get("iter", 0)),
+                    "public": {
+                        "unexpected_fail": int(public.get("unexpected_fail", 0)),
+                        "controller_score_sum": int(
+                            public.get("controller_score_sum", 0)
+                        ),
+                    },
+                    "propose": {
+                        "unexpected_fail": int(propose.get("unexpected_fail", 0)),
+                        "controller_score_sum": int(
+                            propose.get("controller_score_sum", 0)
+                        ),
+                    },
+                    "sealed": {
+                        "unexpected_fail": int(sealed.get("unexpected_fail", 0)),
+                        "controller_score_sum": int(
+                            sealed.get("controller_score_sum", 0)
+                        ),
+                    },
+                    "withheld_survival_ok": bool(
+                        entry.get("withheld_survival_ok", False)
+                    ),
+                    "promotion_upgrades": int(entry.get("promotion_upgrades", 0)),
+                    "promotion_writes_public": int(
+                        entry.get("promotion_writes_public", 0)
+                    ),
+                    "promotion_writes_sealed": int(
+                        entry.get("promotion_writes_sealed", 0)
+                    ),
+                }
+            )
+        dominance_summary = {
+            "schema_version": "v1",
+            "suite_id": loop_summary.get("suite_id", ""),
+            "sealed_suite_id": loop_summary.get("sealed_suite_id", ""),
+            "promotion_index_tier_counts": loop_summary.get(
+                "promotion_index_tier_counts", {}
+            ),
+            "iterations": dominance_iterations,
+        }
+        dominance_path = out_root / "dominance_summary.json"
+        write_json(dominance_path, dominance_summary)
+        ensure_trailing_newline(dominance_path)
+    ensure_dir(out_root)
     resolved_tier_public = prefer_promotion_tier or prefer_tier_public
     resolved_tier_sealed = sealed_prefer_promotion_tier or prefer_tier_sealed
     for value in (resolved_tier_public, resolved_tier_sealed):
@@ -2020,9 +2204,16 @@ def learn_loop_cmd(
         and sealed_prefer_promotion_tier not in {"public", "sealed"}
     ):
         raise typer.BadParameter("--sealed-prefer-promotion-tier must be public|sealed")
-    if proposer_kind not in {"subprocess", "retrieval", "static", "replay", "heuristic_v1"}:
+    if proposer_kind not in {
+        "subprocess",
+        "retrieval",
+        "retrieval_repair_v1",
+        "static",
+        "replay",
+        "heuristic_v1",
+    }:
         raise typer.BadParameter(
-            "--proposer must be subprocess|retrieval|static|replay|heuristic_v1"
+            "--proposer must be subprocess|retrieval|retrieval_repair_v1|static|replay|heuristic_v1"
         )
     prefer_store_propose = True
     prefer_store_sealed = False
@@ -2035,24 +2226,26 @@ def learn_loop_cmd(
         raise typer.BadParameter("--no-improve-patience must be >= 1")
 
     iterations: list[dict[str, Any]] = []
-    history_path = out_dir / "history.jsonl"
+    history_path = out_root / "history.jsonl"
     if history_path.exists():
         history_path.unlink()
     consecutive_no_improve = 0
     stop_reason = "NONE"
     stopped_early = False
+    prev_propose_metrics: dict[str, int] | None = None
+    last_resolved_retrieval_dataset = ""
 
     for idx in range(iters):
-        public_dir = out_dir / f"iter{idx:03d}_public"
-        propose_dir = out_dir / f"iter{idx:03d}_propose"
-        sealed_dir = out_dir / f"iter{idx:03d}_sealed"
+        public_dir = out_root / f"iter{idx:03d}_public"
+        propose_dir = out_root / f"iter{idx:03d}_propose"
+        sealed_dir = out_root / f"iter{idx:03d}_sealed"
 
         suite_run_cmd(
-            suite_file=suite_file,
+            suite_file=resolved_suite_file,
             out_dir=public_dir,
             policy_version="v1",
             warm_start_store=None,
-            promotion_store=promotion_store,
+            promotion_store=None,
             prefer_promotion_store=False,
             prefer_promotion_tier=resolved_tier_public,
             promotion_tier_strict=False,
@@ -2074,6 +2267,9 @@ def learn_loop_cmd(
             candidate_path = public_dir / "dataset.jsonl"
             if candidate_path.exists():
                 resolved_retrieval_dataset = candidate_path
+        if resolved_retrieval_dataset is not None:
+            resolved_retrieval_dataset = Path(resolved_retrieval_dataset).resolve()
+            last_resolved_retrieval_dataset = str(resolved_retrieval_dataset)
         resolved_replay = replay_proposals
         if proposer_kind == "replay" and resolved_replay is None:
             candidate_path = public_dir / "proposals.jsonl"
@@ -2081,7 +2277,7 @@ def learn_loop_cmd(
                 resolved_replay = candidate_path
 
         suite_run_cmd(
-            suite_file=suite_file,
+            suite_file=resolved_suite_file,
             out_dir=propose_dir,
             policy_version="v1",
             warm_start_store=None,
@@ -2103,7 +2299,7 @@ def learn_loop_cmd(
         )
 
         suite_run_cmd(
-            suite_file=sealed_suite_file,
+            suite_file=resolved_sealed_file,
             out_dir=sealed_dir,
             policy_version="v1",
             warm_start_store=None,
@@ -2124,7 +2320,7 @@ def learn_loop_cmd(
             proposer_timeout_s=proposer_timeout_s,
         )
         sealed_report = read_json(sealed_dir / "report.json")
-        sealed_summary = _sealed_summary(sealed_suite_file, sealed_report)
+        sealed_summary = _sealed_summary(resolved_sealed_file, sealed_report)
         sealed_summary_path = sealed_dir / "sealed_summary.json"
         write_json(sealed_summary_path, sealed_summary)
         ensure_trailing_newline(sealed_summary_path)
@@ -2140,6 +2336,9 @@ def learn_loop_cmd(
         propose_seeded_tasks = 0
         propose_changed_tasks = 0
         propose_unchanged_tasks = 0
+        propose_repairs_total = 0
+        propose_repairs_applied_total = 0
+        propose_repairs_failed_total = 0
         if isinstance(per_task_propose, list):
             for entry in per_task_propose:
                 if not isinstance(entry, dict):
@@ -2155,6 +2354,14 @@ def learn_loop_cmd(
                         propose_changed_tasks += 1
                     else:
                         propose_unchanged_tasks += 1
+                repair_kind = entry.get("repair_kind", "")
+                if isinstance(repair_kind, str) and repair_kind:
+                    propose_repairs_total += 1
+                    edits = entry.get("repair_edits_count", 0)
+                    if isinstance(edits, (int, float)) and int(edits) > 0:
+                        propose_repairs_applied_total += 1
+                    if entry.get("proposer_error_atom") or entry.get("verdict") != "PASS":
+                        propose_repairs_failed_total += 1
         propose_proposals_total = _count_jsonl_records(propose_dir / "proposals.jsonl")
         metrics_propose["propose_proposals_total"] = propose_proposals_total
         metrics_propose["propose_programs_total"] = propose_programs_total
@@ -2162,14 +2369,54 @@ def learn_loop_cmd(
         metrics_propose["propose_seeded_tasks"] = propose_seeded_tasks
         metrics_propose["propose_changed_tasks"] = propose_changed_tasks
         metrics_propose["propose_unchanged_tasks"] = propose_unchanged_tasks
+        metrics_propose["propose_repairs_total"] = propose_repairs_total
+        metrics_propose["propose_repairs_applied_total"] = propose_repairs_applied_total
+        metrics_propose["propose_repairs_failed_total"] = propose_repairs_failed_total
         if propose_programs_total == 0 and not allow_empty_propose:
-            console.print("learn loop propose phase emitted zero programs")
+            print("learn loop propose phase emitted zero programs")
+            stop_reason = "EMPTY_PROPOSE"
+            stopped_early = True
+            iter_summary = {
+                "iter": idx,
+                "public": metrics_public,
+                "propose": metrics_propose,
+                "sealed": {},
+                "deltas": {},
+                "stop_reason": stop_reason,
+                "stopped_early": True,
+            }
+            iter_summary_path = out_root / f"iter{idx:03d}_summary.json"
+            write_json(iter_summary_path, iter_summary)
+            ensure_trailing_newline(iter_summary_path)
+            loop_summary = {
+                "schema_version": "v3",
+                "suite_id": read_json(resolved_suite_file).get(
+                    "suite_id", resolved_suite_file.stem
+                ),
+                "config": {
+                    "iters": iters,
+                    "stop_on_no_improve": stop_on_no_improve,
+                    "allow_empty_propose": allow_empty_propose,
+                    "resolved_sealed_suite_file": str(resolved_sealed_file),
+                },
+                "stop_reason": stop_reason,
+                "stopped_early": True,
+                "iterations": iterations + [iter_summary],
+            }
+            summary_path = out_root / "loop_summary.json"
+            write_json(summary_path, loop_summary)
+            ensure_trailing_newline(summary_path)
+            _write_dominance_summary(loop_summary, loop_summary.get("iterations", []))
             raise typer.Exit(code=1)
         sealed_kpis_scaled = _scale_kpi_averages(
             sealed_summary.get("per_domain_kpi_averages", {})
         )
         deltas = _phase_selected_deltas(metrics_public, metrics_propose)
         improved = _is_phase_improved(metrics_public, metrics_propose)
+        improved_over_prev = True
+        if prev_propose_metrics is not None:
+            improved_over_prev = _is_phase_improved(prev_propose_metrics, metrics_propose)
+        # deterministic improve gate based on unexpected_fail and controller_score_sum
         if not improved:
             consecutive_no_improve += 1
         else:
@@ -2183,20 +2430,32 @@ def learn_loop_cmd(
 
         promotion_writes_sealed = 0
         promotion_upgrades = 0
-        if int(metrics_sealed.get("unexpected_fail", 0)) == 0:
+        expected_fail_count = int(metrics_sealed.get("expected_fail", 0))
+        withheld_survival_ok = (
+            int(metrics_sealed.get("unexpected_fail", 0)) == 0
+            and int(metrics_sealed.get("fail", 0)) == expected_fail_count
+        )
+        if withheld_survival_ok:
             promotion_writes_sealed, promotion_upgrades = _commit_sealed_promotions(
                 sealed_report, sealed_dir, promotion_store
             )
 
         tier_counts = _promotion_index_tier_counts(promotion_store)
 
+        sealed_payload = {
+            **metrics_sealed,
+            "sealed_kpi_averages_scaled": sealed_kpis_scaled,
+        }
         iter_summary = {
             "iter": idx,
             "public": metrics_public,
             "propose": metrics_propose,
-            "sealed": {
-                **metrics_sealed,
-                "sealed_kpi_averages_scaled": sealed_kpis_scaled,
+            "sealed": sealed_payload,
+            "sealed_withheld": dict(sealed_payload),
+            "withheld_survival_ok": withheld_survival_ok,
+            "config": {
+                "resolved_retrieval_dataset": last_resolved_retrieval_dataset,
+                "resolved_sealed_suite_file": str(resolved_sealed_file),
             },
             "deltas": {"propose_minus_public": deltas},
             "promotion_index_tier_counts": tier_counts,
@@ -2204,11 +2463,12 @@ def learn_loop_cmd(
             "promotion_writes_sealed": promotion_writes_sealed,
             "promotion_upgrades": promotion_upgrades,
             "improved": improved,
+            "improved_over_prev": improved_over_prev,
             "no_improve_streak": consecutive_no_improve,
             "stop_reason": "NONE",
             "stopped_early": False,
         }
-        iter_summary_path = out_dir / f"iter{idx:03d}_summary.json"
+        iter_summary_path = out_root / f"iter{idx:03d}_summary.json"
         write_json(iter_summary_path, iter_summary)
         ensure_trailing_newline(iter_summary_path)
         if write_history:
@@ -2222,6 +2482,7 @@ def learn_loop_cmd(
             write_jsonl_line(history_path, history_row)
 
         iterations.append(iter_summary)
+        prev_propose_metrics = dict(metrics_propose)
 
         if stop_on_propose_pass_all and metrics_propose["fail"] == 0:
             stop_reason = "PROPOSE_PASS_ALL"
@@ -2240,9 +2501,7 @@ def learn_loop_cmd(
     loop_summary = {
         "schema_version": "v3",
         "suite_id": read_json(suite_file).get("suite_id", suite_file.stem),
-        "sealed_suite_id": read_json(sealed_suite_file).get(
-            "suite_id", sealed_suite_file.stem
-        ),
+        "sealed_suite_id": sealed_suite_id,
         "config": {
             "iters": iters,
             "stop_on_no_improve": stop_on_no_improve,
@@ -2255,6 +2514,8 @@ def learn_loop_cmd(
             "prefer_promotion_tier": resolved_tier_public,
             "sealed_prefer_promotion_tier": resolved_tier_sealed,
             "proposer": proposer_kind,
+            "resolved_retrieval_dataset": last_resolved_retrieval_dataset,
+            "resolved_sealed_suite_file": str(resolved_sealed_file),
         },
         "stop_reason": stop_reason,
         "stopped_early": stopped_early,
@@ -2266,6 +2527,7 @@ def learn_loop_cmd(
             "public": last_iter.get("public", {}),
             "propose": last_iter.get("propose", {}),
             "sealed": last_iter.get("sealed", {}),
+            "sealed_withheld": last_iter.get("sealed_withheld", {}),
         }
         loop_summary["improved"] = last_iter.get("improved")
         loop_summary["no_improve_streak"] = last_iter.get("no_improve_streak")
@@ -2276,9 +2538,10 @@ def learn_loop_cmd(
         )
     else:
         loop_summary["promotion_index_tier_counts"] = {}
-    summary_path = out_dir / "loop_summary.json"
+    summary_path = out_root / "loop_summary.json"
     write_json(summary_path, loop_summary)
     ensure_trailing_newline(summary_path)
+    _write_dominance_summary(loop_summary, iterations)
     console.print({"loop_summary": str(summary_path)})
 
 

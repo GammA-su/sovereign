@@ -1,0 +1,45 @@
+F..
+=================================== FAILURES ===================================
+______________________ test_learn_loop_multi_iter_history ______________________
+
+tmp_path = PosixPath('/tmp/pytest-of-alpahos/pytest-167/test_learn_loop_multi_iter_his0')
+
+    def test_learn_loop_multi_iter_history(tmp_path: Path) -> None:
+        suite_file = tmp_path / "suite.json"
+        sealed_suite_file = tmp_path / "sealed.json"
+        _write_suite(suite_file, ["examples/tasks/pyfunc_fail_01.json"])
+        _write_suite(sealed_suite_file, ["examples/tasks/pyfunc_fail_01.json"])
+        proposer_script = (
+            Path(__file__).resolve().parent / "fixtures" / "proposer_heuristic_v1.py"
+        )
+        out_dir = _run_loop(
+            tmp_path,
+            iters=3,
+            stop_on_no_improve=5,
+            proposer_script=proposer_script,
+            suite_file=suite_file,
+            sealed_suite_file=sealed_suite_file,
+            prefer_promotion_store=True,
+        )
+        history_path = out_dir / "history.jsonl"
+        assert history_path.exists()
+        history_lines = history_path.read_text(encoding="utf-8").splitlines()
+        assert len(history_lines) == 3
+    
+        for idx in range(3):
+            for phase in ("public", "propose", "sealed"):
+                phase_dir = out_dir / f"iter{idx:03d}_{phase}"
+                assert (phase_dir / "report.norm.json").exists()
+                assert (phase_dir / "dataset_meta.json").exists()
+                audit_report = audit_store(phase_dir / "store")
+                assert audit_report["ok"] is True
+        iter_summary = read_json(out_dir / "iter001_summary.json")
+        assert iter_summary["promotion_writes_public"] >= 0
+        assert iter_summary["promotion_writes_sealed"] >= 0
+>       assert iter_summary["promotion_upgrades"] >= 1
+E       assert 0 >= 1
+
+tests/test_learn_loop_multi_iter.py:102: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_learn_loop_multi_iter.py::test_learn_loop_multi_iter_history
+1 failed, 2 passed in 34.51s

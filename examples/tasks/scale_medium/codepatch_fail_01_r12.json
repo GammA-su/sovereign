@@ -1,0 +1,1 @@
+{"bounds":{},"examples":[],"family":"codepatch","goal":"fix_tests","inputs":{},"metadata":{"codepatch":{"candidate_patch":"--- a/mini_proj/core.py\n+++ b/mini_proj/core.py\n@@ -5,1 +5,1 @@\n-    return a - b\n+    return a\n","fixture":"examples/fixtures/mini_proj"}},"output":"patch","task_id":"codepatch_fail_01_r12","task_type":"codepatch"}

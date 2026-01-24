@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     retrieval_dataset: Optional[str] = None
     pyfunc_minimize_budget: int = 50
     is_sealed_run: bool = False
+    families_mode: str = "public"
     suite_id: Optional[str] = None
     dataset_train_path: Optional[str] = None
     dataset_val_path: Optional[str] = None

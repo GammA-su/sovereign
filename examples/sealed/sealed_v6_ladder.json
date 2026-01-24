@@ -1,0 +1,148 @@
+{
+  "suite_id": "sealed_v6_ladder",
+  "tasks": [
+    {
+      "task_file": "examples/tasks/pyfunc_01.json",
+      "expected_verdict": "PASS",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/pyfunc_fail_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/pyfunc_ladder_r1_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/pyfunc_ladder_r2_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/codepatch_pass_01.json",
+      "expected_verdict": "PASS",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/codepatch_fail_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/codepatch_ladder_r1_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/codepatch_ladder_r2_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_pass_01.json",
+      "expected_verdict": "PASS",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_fail_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_ladder_r1_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_ladder_r2_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    },
+    {
+      "task_file": "examples/tasks/jsonspec_sealed_trap_01.json",
+      "expected_verdict": "FAIL",
+      "overrides": {
+        "policy_version": "v3",
+        "break_budget_attempts": 1,
+        "verify_budget_steps": 5,
+        "synth_budget": 1,
+        "pyfunc_minimize_budget": 0
+      }
+    }
+  ]
+}

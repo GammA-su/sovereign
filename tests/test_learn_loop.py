@@ -46,7 +46,7 @@ def test_learn_loop_deterministic(tmp_path: Path) -> None:
         assert audit_report["ok"] is True
 
     sealed_report = read_json(out_root_a / "iter000_sealed" / "report.json")
-    assert sealed_report.get("families_mode") == "sealed"
+    assert sealed_report.get("families_mode") == "withheld_v1"
     assert sealed_report.get("is_sealed_run") is True
     sealed_updates = sealed_report.get("store_updates", [])
     if isinstance(sealed_updates, list) and sealed_updates:
